@@ -201,7 +201,6 @@ paths:
         Issues a token that players provisioned with a `bsn` setup use to join the
         selected network. No request body. Copy all four fields of the result into the
         setup's `bsnDeviceRegistrationTokenEntity`. Requires a selected session network.
-      x-required-scope: bsn.api.main.devices.setups.token.create
       x-requires-network-session: true
       responses:
         '201':
@@ -235,7 +234,6 @@ paths:
       tags: [Registration tokens]
       operationId: validateRegistrationToken
       summary: Validate a device registration token
-      x-required-scope: bsn.api.main.devices.setups.token.validate
       x-requires-network-session: true
       responses:
         '200':
@@ -259,7 +257,6 @@ paths:
       description: |-
         Players that have not yet registered with this token can no longer use it. A
         `cert`-scope token is shared by every player provisioned from the setup.
-      x-required-scope: bsn.api.main.devices.setups.token.revoke
       x-requires-network-session: true
       responses:
         '204':

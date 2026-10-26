@@ -156,10 +156,9 @@ minute and catches every failure we hit on first contact with production.
 
 | Item | Notes |
 |---|---|
-| API client id and secret | An OAuth2 client created in BSN.cloud. B-Deploy acts as the client's **owner**, so the owning account must be a user in the target network. |
+| API client id and secret | An OAuth2 client created in BSN.cloud. When you create it, make sure you add scope for **all the Device actions**. B-Deploy acts as the client's **owner**, so the owning account must be a user in the target network. |
 | Network name | Exactly as BSN.cloud shows it (case and spaces matter). |
 | Account e-mail | Only needed to create setups and devices (`bDeploy.username`, `username`). |
-| Scope `bsn.api.main.devices.setups.token.create` | Only needed to create registration tokens (`bsn` setups). |
 | Production hosts | `auth.bsn.cloud`, `api.bsn.cloud`, `provision.bsn.cloud`. Credentials from another environment fail with `invalid_client`. |
 
 ### Run the check
@@ -640,9 +639,8 @@ curl -s -X POST https://api.bsn.cloud/2022/06/REST/Provisioning/Setups/Tokens/ \
 
 Copy all four fields into `bsnDeviceRegistrationTokenEntity`. The token has `cert`
 scope, is shared by every player provisioned from the setup, and is valid for two years
-by default. Scopes needed: `bsn.api.main.devices.setups.token.create` (create),
-`…token.validate` (`GET …/Tokens/{token}/`) and `…token.revoke` (`DELETE …/Tokens/{token}/`).
-Revoking a token stops every player that has not yet registered with it.
+by default. Validate a token with `GET …/Tokens/{token}/` and revoke it with
+`DELETE …/Tokens/{token}/`. Revoking a token stops every player that has not yet registered with it.
 
 ## 11. What the player does
 

@@ -145,10 +145,9 @@ The AI coding assistant skill knows these gaps too.
 
 | Item | Where it comes from |
 |---|---|
-| **API client id and secret** | Create an API client in BSN.cloud. B-Deploy acts as the client's owner, so the owning account must be a user in the network you will provision into. |
+| **API client id and secret** | Create an API client in BSN.cloud, and make sure you add scope for **all the Device actions** when you create it. B-Deploy acts as the client's owner, so the owning account must be a user in the network you will provision into. |
 | **Network name** | Exactly as BSN.cloud shows it; case and spaces matter. |
 | **Account e-mail** | The BSN.cloud user name. Needed to create setups and register players. |
-| **Registration-token scope** (optional) | `bsn.api.main.devices.setups.token.create` on the API client. Needed only for setups whose players join BSN.cloud. |
 
 Every example in this repository reads these from the same environment variables:
 

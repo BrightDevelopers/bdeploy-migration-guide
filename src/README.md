@@ -62,8 +62,7 @@ flowchart TD
 - Only records the run created are deleted. If a step fails, the remaining cleanup runs
   newest-first (device, then setup, then token). Each cleanup is reported as a step.
 - Usernames containing `brightsign`, `bsn` or `bacon` make the C# service demand a
-  registration token even for `partnerApplication`. The run creates and revokes one,
-  which needs the `bsn.api.main.devices.setups.token.create` and `…token.revoke` scopes.
+  registration token even for `partnerApplication`. The run creates and revokes one.
 
 ## Rules the client follows
 

@@ -52,6 +52,8 @@ new token plus a new network selection.
 Configuration convention: `BS_CLIENT_ID`, `BS_SECRET`, `BS_NETWORK`, and `BS_USERNAME`
 (the account e-mail, needed for setup and device writes). Optional: `BS_AUTH_URL`,
 `BS_API_URL` and `BS_PROVISION_URL` for non-production hosts. Never hard-code the secret.
+When the API client id and secret are created in BSN.cloud, the client must be given
+scope for **all the Device actions**.
 
 ## Wire contract
 | Operation | Correct request | Response `result` |
@@ -126,7 +128,7 @@ and creates return 201. Main API (`api.bsn.cloud`) responses are bare JSON.
    - A partner content URL means `partnerApplication` with `bDeploy.url`, which must be
      an absolute URL. `sfn` needs `sfnWebFolderUrl`. Otherwise, ask.
    - A `bsn` setup requires `bsnDeviceRegistrationTokenEntity`, copied from the token
-     create call. That needs the `bsn.api.main.devices.setups.token.create` scope.
+     create call.
    - **C# also demands a registration token when `bDeploy.username` contains
      `brightsign`, `bsn` or `bacon`** (case-insensitive), whatever the `setupType`.
      Test with the account you will really use.
