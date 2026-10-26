@@ -12,7 +12,8 @@ This repository gives you what you need to automate B-Deploy from your own syste
 - OpenAPI 3.0 specifications you can browse or feed to a code generator;
 - a ready-to-run Python test client that checks your credentials and exercises the API;
 - an AI coding assistant skill that applies all of this to your code ([install it](#ai-coding-assistant-skill));
-- connection details for the [BrightDeveloper MCP server](#brightdeveloper-mcp-server), which lets an assistant search BrightSign's developer docs.
+- connection details for the [BrightDeveloper MCP server](#brightdeveloper-mcp-server), which lets an assistant search BrightSign's developer docs;
+- a pointer to [GoPurple](#gopurple-go-sdk-and-reference-implementation), BrightSign's Go SDK for all of BrightSign Control.
 
 ## Where to start
 
@@ -25,6 +26,7 @@ This repository gives you what you need to automate B-Deploy from your own syste
 | Generate client code or browse the API | [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) and [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) |
 | Have an AI coding assistant port or review your client code | [AI coding assistant skill](#ai-coding-assistant-skill) |
 | Let your AI assistant search BrightSign's developer docs | [BrightDeveloper MCP server](#brightdeveloper-mcp-server) |
+| Use a Go SDK for all of BrightSign Control, not only B-Deploy | [GoPurple](#gopurple-go-sdk-and-reference-implementation) |
 
 ## AI coding assistant skill
 
@@ -92,6 +94,52 @@ are wrong. The corrections are listed in
 [section 15 of the guide](docs/BDEPLOY-API-GUIDE.md#15-notes-on-the-gopurple-b-deploy-docs).
 For example, device reads never return `setupId`, and updates take the id in the request
 body, not in `?_id=`.
+
+## GoPurple: Go SDK and reference implementation
+
+[GoPurple](https://github.com/BrightDevelopers/gopurple) is BrightSign's Go SDK and
+reference implementation for BrightSign Control (formerly BSN.cloud). It goes well beyond
+B-Deploy and covers:
+
+- **Authentication:** OAuth2 client credentials and network selection, with token
+  handling built in.
+- **Main REST API:** players, groups, subscriptions and registration tokens.
+- **Remote DWS:** player info, health, logs, crash dumps, screenshots, registry, files,
+  network diagnostics, reboot and re-provisioning.
+- **B-Deploy:** setups and device records.
+
+It also ships more than 60 example command-line programs, one per operation. You can
+use them directly in scripts or read them as worked examples. GoPurple reads the same
+`BS_CLIENT_ID`, `BS_SECRET` and `BS_NETWORK` variables as this repository.
+
+```bash
+go get github.com/brightdevelopers/gopurple@v0.2.4
+```
+
+```go
+client, err := gopurple.New() // reads BS_CLIENT_ID and BS_SECRET
+if err != nil {
+    log.Fatal(err)
+}
+if err := client.Authenticate(ctx); err != nil {
+    log.Fatal(err)
+}
+devices, err := client.Devices.List(ctx, nil)
+```
+
+To build the example programs, clone the repository and run `make build`. The
+binaries land in `bin/`; for example, `./bin/bdeploy-list-setups` and
+`./bin/rdws-snapshot --serial <SERIAL>`. Check the
+[releases](https://github.com/BrightDevelopers/gopurple/releases) for the latest version
+before pinning.
+
+**Using GoPurple for B-Deploy:** as of commit `4bc27aa` (after `v0.2.4`), its B-Deploy
+service has gaps that this repository documents. Name filters are ignored, page size is
+never sent (so large lists come back truncated), setup lists drop `setupJson`, and
+updates send partial records. Apply the workarounds in
+[section 15 of the guide](docs/BDEPLOY-API-GUIDE.md#15-notes-on-the-gopurple-b-deploy-docs),
+or call B-Deploy directly as the guide and the [Python test client](src/README.md) do.
+The AI coding assistant skill knows these gaps too.
 
 ## What you need
 
