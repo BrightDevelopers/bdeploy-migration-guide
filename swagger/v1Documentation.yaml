@@ -1,0 +1,1569 @@
+openapi: 3.0.3
+info:
+  title: B-Deploy Provisioning API v1 (legacy)
+  version: 1.0.0
+  description: |-
+    Legacy (v1) B-Deploy provisioning API. v1 uses B-Deploy-local user accounts and an
+    HS256 JWT issued by `POST /rest/v1/authenticate`; it does **not** accept BSN.cloud
+    OAuth2 tokens. New integrations should use the v2/v3 API (`bdeploy-v2-v3.yaml`).
+
+    Two services sit behind one host:
+
+    | Public path prefix | Service | Rewritten to |
+    |---|---|---|
+    | `/rest/` | PVS (provisioning/device server) | `/` |
+    | `/rest-device/` | PVS (provisioning/device server) | `/` |
+    | `/rest-setup/` | PSS (provisioning setup server) | `/` |
+
+    So `POST /rest/v1/authenticate` is served by PVS as `POST /v1/authenticate`.
+
+    ## Response envelope
+    Every JSON response, success or failure, is wrapped as
+    `{"error": <string|null>, "result": <any>}`. On failure `error` is a message string
+    and `result` is `null` (a few error paths return `result` too). When the server fails
+    without setting a status explicitly, the status is **500** even for client mistakes;
+    the documented 500 responses below include such cases.
+
+    ## Identifiers
+    Device (`_id`) and setup (`_id`) identifiers are MongoDB ObjectIds: 24 hexadecimal
+    characters. Any other format is rejected with 400.
+
+    ## Source of truth
+    Derived from `bsn-core/provisioning-server` (PVS `server/api-utils-v1.js`,
+    PSS `external/pss/pss-server/api-utils-v1.js`) and cross-checked against the
+    `gopurple` SDK. See `docs/IMPLEMENTATION-NOTES.md` for known server defects that affect
+    v1 callers (notably: v1 has no per-account isolation on several device operations).
+  contact:
+    name: BrightSign
+    url: https://www.brightsign.biz
+servers:
+  - url: https://provision.bsn.cloud
+    description: Production
+  - url: https://provision.bsn-staging.net
+    description: Staging
+  - url: https://provision.bsn-qa.net
+    description: QA
+  - url: https://provision.bsn-dev.net
+    description: Development
+tags:
+  - name: Authentication
+    description: Obtain a v1 JWT.
+  - name: Devices
+    description: Player (device) records — PVS, `/rest-device/v1`.
+  - name: Setups
+    description: Device setup records — PSS, `/rest-setup/v1`.
+  - name: Internal
+    description: Service-to-service or administrative endpoints. Not for partner use.
+  - name: Player protocol
+    description: |-
+      Endpoints called by BrightSign players during provisioning. They require the
+      player's mTLS client certificate (the gateway forwards it as
+      `x-forwarded-client-cert`); API clients cannot call them. Documented so the
+      provisioning flow is complete.
+paths:
+  /rest/v1/authenticate:
+    post:
+      tags: [Authentication]
+      operationId: authenticateV1
+      summary: Exchange B-Deploy credentials for a v1 JWT
+      description: |-
+        Validates a B-Deploy-local account (not a BSN.cloud account) and returns an HS256
+        JWT valid for 60 minutes. The response also carries an `Expires` header (RFC 1123).
+        The same token is accepted by both the device (`/rest-device/v1`) and setup
+        (`/rest-setup/v1`) endpoints.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Token issued.
+          headers:
+            Expires:
+              description: Token expiry, RFC 1123 date.
+              schema:
+                type: string
+                example: 'Mon, 26 Oct 2026 18:00:00 GMT'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: string
+                        description: 'The JWT to send as `Authorization: Bearer <token>`.'
+                        example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
+        '400':
+          description: '`username` or `password` missing (`error`: "Incorrect credentials").'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: '"Unknown user" or "Incorrect credentials".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+  /rest-device/v1/device:
+    get:
+      tags: [Devices]
+      operationId: getDevicesV1
+      summary: Get one device by id, or query devices
+      description: |-
+        Behaviour depends on the query string:
+
+        * `_id` present: returns the single matching device **object** (not a list), or
+          404 if the id does not exist. Other parameters are ignored.
+        * otherwise at least one filter (`serial`, `NetworkName`/`account`, `username`,
+          `setupId`, `model`, or a `query[...]` field) is required. With no filter the
+          server returns an empty list (`total: 0`).
+        * Non-admin callers only see records whose `client` equals their own username.
+        * If the filtered query matches nothing and `serial` was given, the server retries
+          with `serial` alone across all accounts and returns that record (0 or 1) in the
+          list shape.
+
+        Filters may be supplied flat (`serial=...`) or in the bracketed `qs` form
+        (`query[serial]=...`, `sort[serial]=1`, `page[pageSize]=10`). Bracketed values
+        override flat ones. `username` matching is a case-insensitive prefix match.
+
+        `setupId` is never returned: the server strips it from every device in GET
+        responses.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQueryOptional'
+        - $ref: '#/components/parameters/SerialQuery'
+        - $ref: '#/components/parameters/NetworkNameQuery'
+        - $ref: '#/components/parameters/AccountQuery'
+        - $ref: '#/components/parameters/UsernameQuery'
+        - $ref: '#/components/parameters/SetupIdQuery'
+        - $ref: '#/components/parameters/ModelQuery'
+        - $ref: '#/components/parameters/PageNumQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+        - $ref: '#/components/parameters/DeviceQueryObject'
+        - $ref: '#/components/parameters/SortObject'
+        - $ref: '#/components/parameters/PageObject'
+      responses:
+        '200':
+          description: |-
+            A `DeviceList` when querying, or a single `Device` (or `null`) when `_id` is
+            given.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/DeviceList'
+                          - $ref: '#/components/schemas/Device'
+                          - $ref: '#/components/schemas/JsonNull'
+        '400':
+          description: Invalid `_id`, `pageNum` < 1, `pageSize` outside 1-100, invalid `serial`, or malformed Authorization header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '`_id` given but no such device ("Device ID does not exist").'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    post:
+      tags: [Devices]
+      operationId: createDevicesV1
+      summary: Register one or more devices
+      description: |-
+        Registers player serial numbers. The body may be a single `DeviceInput` or an
+        array of them.
+
+        * `client` is always overwritten with the caller's username.
+        * `serial` and `model` are upper-cased on create.
+        * `serial` is globally unique across all accounts. If a record with the serial
+          already exists and has a `NetworkName`, the request fails with
+          "Player already exists".
+        * POST never updates a registered device: any record with a `NetworkName` hits the
+          "Player already exists" check first. Use PUT to change a device.
+        * For an **array** body the serial checks are skipped (they read
+          `req.body.serial`), so an already-registered serial fails on the unique index
+          with a duplicate-key error instead.
+        * When `setupId` is given, the server resolves the setup's package name and
+          stores it as `setupName`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/DeviceInput'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/DeviceInput'
+      responses:
+        '201':
+          description: |-
+            Created or updated. `result` is the device id for a single-object body, or an
+            array of ids for an array body.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/ObjectId'
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/ObjectId'
+        '400':
+          description: |-
+            Validation failure ("Serial is required", "Username is required",
+            "Network name is required" for BSN clients, "Player already exists",
+            duplicate-key errors, mongoose validation errors such as `userdata` > 1024
+            characters).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    put:
+      tags: [Devices]
+      operationId: updateDeviceV1
+      summary: Replace a device record
+      description: |-
+        **Full replacement**, not a partial update: the stored record is deleted and the
+        body saved in its place under the same `_id`. Omitted fields are lost, and
+        `createdAt` is reset unless the body sends it back.
+
+        `_id` (in the body) must reference an existing device; the record is located by
+        the body's `serial`, which is therefore also required. `client` is overwritten with
+        the caller's username. If `setupId` is absent but `setupName` and `NetworkName` are
+        present, the server looks up the setup id by name.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceUpdate'
+      responses:
+        '200':
+          description: Updated. `result` is `null`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullResultEnvelope'
+        '400':
+          description: 'Missing/invalid `_id`, "Device doesn''t exist: <serial>", or "Invalid device: ..." validation error.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Device ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    delete:
+      tags: [Devices]
+      operationId: deleteDeviceV1
+      summary: Delete a device by id or serial
+      description: Deletes by `_id` if given, otherwise by `serial`. One of them is required.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQueryOptional'
+        - $ref: '#/components/parameters/SerialQuery'
+      responses:
+        '200':
+          description: Deleted. `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: Neither `_id` nor `serial` given ("Missing ID or Serial number"), or invalid `_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Device ID does not exist" or "Serial number does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v1/device/{_id}:
+    get:
+      tags: [Devices]
+      operationId: getDeviceByIdV1
+      summary: Get a device by id
+      description: Returns the single device object. `setupId` is stripped from the response.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdPath'
+      responses:
+        '200':
+          description: The device.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/Device'
+        '400':
+          description: Invalid id format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Device ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v1/device/ids/{idarray}:
+    delete:
+      tags: [Devices]
+      operationId: deleteDevicesByIdsV1
+      deprecated: true
+      summary: Bulk delete devices (non-functional in v1)
+      description: |-
+        **Do not use.** The v1 route handler calls the bulk-delete service with the wrong
+        arguments and fails with a 500 (non-JSON) response for every well-formed request;
+        a malformed array also produces a 500. Use the v2 endpoint
+        `DELETE /rest-device/v2/device/ids/{idarray}` instead.
+      parameters:
+        - $ref: '#/components/parameters/IdArrayPath'
+      responses:
+        '400':
+          description: |-
+            Array contains non-string entries. (A malformed, non-array or empty array
+            gives a non-JSON 500.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '500':
+          description: Server error (see description).
+
+  /rest-setup/v1/setup:
+    get:
+      tags: [Setups]
+      operationId: getSetupsV1
+      summary: Get one setup by id, or list setups
+      description: |-
+        * `_id` present: returns the single `DeviceSetupV1` object, or `null` if no setup
+          has that id (200). The id is not validated on this route.
+        * otherwise returns a `DeviceSetupV1List`, sorted by `PackageName` ascending.
+          Non-admin callers only see setups whose `client` equals their username.
+          `NetworkName` and `username` are exact-match filters.
+      parameters:
+        - name: _id
+          in: query
+          required: false
+          description: Setup id.
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: NetworkName
+          in: query
+          required: false
+          schema:
+            type: string
+          example: mynetwork
+        - name: username
+          in: query
+          required: false
+          schema:
+            type: string
+          example: user@example.com
+        - $ref: '#/components/parameters/PageNumQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+      responses:
+        '200':
+          description: A list, or a single setup (or `null`) when `_id` is given.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/DeviceSetupV1List'
+                          - $ref: '#/components/schemas/DeviceSetupV1'
+                          - $ref: '#/components/schemas/JsonNull'
+        '400':
+          description: '`pageNum` < 1 or `pageSize` outside 1-100, or malformed Authorization header.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+    post:
+      tags: [Setups]
+      operationId: createSetupsV1
+      summary: Create one or more setups
+      description: |-
+        Body is a single `DeviceSetupV1Input` or an array. `client` is set to the caller's
+        username and any `_id` is discarded. `PackageName` must be unique per
+        `client` + `NetworkName`. Records are inserted directly, so mongoose defaults and
+        `createdAt`/`updatedAt` timestamps are not applied on create.
+
+        The `Content-Type` header must be exactly `application/json`; a charset suffix
+        (`application/json; charset=utf-8`) is rejected with 415 by this service.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/DeviceSetupV1Input'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/DeviceSetupV1Input'
+      responses:
+        '201':
+          description: Created. `result` is one id, or an array of ids when more than one setup was posted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/ObjectId'
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/ObjectId'
+        '400':
+          description: |-
+            Validation failure, e.g. "Invalid setup: PackageName must be unique", or for
+            BSN clients "Invalid setup: Error: NetworkName is required".
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    put:
+      tags: [Setups]
+      operationId: updateSetupV1
+      summary: Replace a setup
+      description: |-
+        **Full replacement**: the stored setup is deleted and the body saved under the same
+        `_id`. `_id` in the body is required and must exist. `client` is set to the
+        caller's username. There is no ownership check on this route.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceSetupV1Update'
+      responses:
+        '200':
+          description: Updated. `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: 'Missing or invalid `_id`, or "Invalid setup: ..." validation error.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    delete:
+      tags: [Setups]
+      operationId: deleteSetupV1
+      summary: Delete a setup
+      description: |-
+        Refuses to delete a setup that any device still references (`setupId`); that case
+        returns **500** with `error` "Error: Cannot delete device setup because it is in
+        use". There is no ownership check on this route.
+      parameters:
+        - name: _id
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+      responses:
+        '200':
+          description: Deleted. `result` is the MongoDB delete result.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/MongoDeleteResult'
+        '400':
+          description: Missing or invalid `_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Setup is in use by at least one device, or the in-use check failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v1/setup/{_id}:
+    get:
+      tags: [Setups]
+      operationId: getSetupByIdV1
+      summary: Get a setup by id
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          description: The setup (a single object, not an array).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/DeviceSetupV1'
+        '400':
+          description: Invalid id format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v1/setup-package/{_id}:
+    get:
+      tags: [Setups]
+      operationId: downloadSetupPackageV1
+      summary: Download the generated setup package for a setup
+      description: |-
+        Builds and streams the setup package (`autorun.zip` contents for the given setup)
+        as a ZIP attachment. Response headers `Package-Name` and `Package-Path` are also
+        set by the server.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          description: ZIP archive.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename=k3j4h5g6.zip'
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid id format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Package generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v1/count-setups/{setupId}:
+    get:
+      tags: [Internal]
+      operationId: countDevicesUsingSetupV1
+      summary: Count devices referencing a setup (used by PSS)
+      parameters:
+        - name: setupId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+      responses:
+        '200':
+          description: '`result` is the number of devices whose `setupId` matches.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: integer
+                        minimum: 0
+        '400':
+          description: Missing or invalid setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/InvalidJwt'
+
+  /rest-device/v1/create-user:
+    post:
+      tags: [Internal]
+      operationId: createUserV1
+      summary: Create a B-Deploy-local v1 account
+      description: Internal. Requires the shared `api-rma-token` header instead of a bearer token.
+      security:
+        - RmaToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: '`result` is the new user id.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/ObjectId'
+        '400':
+          description: Missing credentials or database error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: 'Missing or wrong `api-rma-token` ("Error: Invalid token").'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: '"User already exists".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+  /rest-device/v1:
+    get:
+      tags: [Player protocol]
+      operationId: playerEntryV1
+      summary: Player provisioning entry point (v1 rules)
+      description: |-
+        Looks up the most recently created device record for the `DeviceID` serial.
+        Redirects (301) to the PSS v1 provisioning-script URL when the record belongs to a
+        BSN client (with `username` and `NetworkName`) or has both `url` and `username`.
+        Unknown Cisco DMP models (`CV-UHD`, `CV-HD`, `SV-4K`, `DMP-2K`) are redirected to
+        Cisco's provisioning service. Otherwise 204.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/DeviceModelHeader'
+      responses:
+        '204':
+          description: Nothing to provision for this player.
+        '301':
+          description: Redirect to the provisioning script.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '401':
+          description: '"You are not a valid BrightSign player" (no client certificate).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v1/setup-script/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getProvisioningScriptV1
+      summary: BrightScript provisioning script for a player
+      description: |-
+        `deviceObject` is a base64-encoded JSON device record produced by PVS, containing a
+        short-lived (5 minute) JWT in `authToken`. Returns a BrightScript that downloads
+        the setup package and, when the v1 setup specifies `FirmwareURL` or
+        `FirmwareVersion`, a firmware update.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+      responses:
+        '200':
+          description: BrightScript source.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          description: '"Missing device object", "Invalid device object", or invalid setup id.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Setup id in the device object does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Expired/invalid embedded token, or script generation failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v1/setup-package/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getSetupPackageForPlayerV1
+      summary: Setup package ZIP for a player
+      description: |-
+        Refreshes the setup's BSN registration token if it is within 25% of expiry, then
+        returns the setup package ZIP.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Missing/invalid device object or setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Registration-token refresh or package generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v1/runtime-script/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getRuntimeScriptV1
+      summary: Partner runtime (recovery) script
+      description: |-
+        Returns a BrightScript that downloads the partner presentation (`autorun.zip`)
+        from the device record's `url`, sending `userdata` as a `UserData` header. Returns
+        204 (with the script body) if the `StorageStatus` header reports an existing
+        autorun. Since 2026-10 this route is also served by the C# provisioning service.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+        - $ref: '#/components/parameters/StorageStatusHeader'
+      responses:
+        '200':
+          description: BrightScript source.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '204':
+          description: An autorun is already present on the player's storage.
+        '400':
+          description: Missing or invalid device object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+components:
+  securitySchemes:
+    BearerJwtV1:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |-
+        HS256 JWT from `POST /rest/v1/authenticate`, valid 60 minutes. Missing header →
+        400 "Authorization header required"; header not of the form `Bearer <token>` →
+        400; invalid/expired token → 401.
+    RmaToken:
+      type: apiKey
+      in: header
+      name: api-rma-token
+      description: Shared internal service token.
+    PlayerClientCertificate:
+      type: apiKey
+      in: header
+      name: x-forwarded-client-cert
+      description: |-
+        Set by the gateway from the player's mTLS client certificate. Cannot be supplied
+        by API clients.
+
+  parameters:
+    DeviceIdPath:
+      name: _id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    SetupIdPath:
+      name: _id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    IdArrayPath:
+      name: idarray
+      in: path
+      required: true
+      description: URL-encoded JSON array of device ids, e.g. `%5B%2264b0...%22%5D`.
+      schema:
+        type: string
+      example: '["64b0c3f2a1b2c3d4e5f60718","64b0c3f2a1b2c3d4e5f60719"]'
+    DeviceIdQueryOptional:
+      name: _id
+      in: query
+      required: false
+      description: Device id.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    SerialQuery:
+      name: serial
+      in: query
+      required: false
+      description: Player serial number. Stored upper-case; matching is exact.
+      schema:
+        type: string
+      example: 'D7E89K000123'
+    NetworkNameQuery:
+      name: NetworkName
+      in: query
+      required: false
+      schema:
+        type: string
+      example: mynetwork
+    AccountQuery:
+      name: account
+      in: query
+      required: false
+      description: Legacy alias for `NetworkName`.
+      schema:
+        type: string
+    UsernameQuery:
+      name: username
+      in: query
+      required: false
+      description: Case-insensitive prefix match.
+      schema:
+        type: string
+      example: user@example.com
+    SetupIdQuery:
+      name: setupId
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    ModelQuery:
+      name: model
+      in: query
+      required: false
+      schema:
+        type: string
+      example: XT1144
+    PageNumQuery:
+      name: pageNum
+      in: query
+      required: false
+      description: 1-based page number.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeQuery:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+    DeviceQueryObject:
+      name: query
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: |-
+        Bracketed filters, `query[<field>]=<value>`, applied as an exact-match MongoDB
+        filter on device fields (e.g. `NetworkName`, `serial`, `setupId`, `setupName`,
+        `model`, `username`). Numeric-looking values are converted to numbers, and
+        `true`/`false`/`null` to their literal values.
+      schema:
+        type: object
+        additionalProperties:
+          type: string
+    SortObject:
+      name: sort
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: '`sort[<field>]=1` (ascending) or `-1` (descending).'
+      schema:
+        type: object
+        additionalProperties:
+          type: integer
+          enum: [1, -1]
+    PageObject:
+      name: page
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: '`page[pageNum]` and `page[pageSize]`; same rules as the flat parameters.'
+      schema:
+        type: object
+        properties:
+          pageNum:
+            type: integer
+            minimum: 1
+          pageSize:
+            type: integer
+            minimum: 1
+            maximum: 100
+    DeviceObjectPath:
+      name: deviceObject
+      in: path
+      required: true
+      description: Base64-encoded JSON device object generated by PVS.
+      schema:
+        type: string
+    DeviceIdHeader:
+      name: DeviceID
+      in: header
+      required: true
+      description: Player serial number.
+      schema:
+        type: string
+    DeviceModelHeader:
+      name: DeviceModel
+      in: header
+      required: false
+      schema:
+        type: string
+    StorageStatusHeader:
+      name: StorageStatus
+      in: header
+      required: false
+      description: e.g. `usb1=none;sd=autorun;sd2=none;ssd=none;`
+      schema:
+        type: string
+
+  responses:
+    InvalidJwt:
+      description: Invalid or expired v1 JWT.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnsupportedMediaType:
+      description: '`Content-Type` is not `application/json`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    ObjectId:
+      type: string
+      pattern: '^[0-9a-fA-F]{24}$'
+      description: MongoDB ObjectId.
+      example: 64b0c3f2a1b2c3d4e5f60718
+
+    JsonNull:
+      type: object
+      nullable: true
+      enum: [null]
+      description: The JSON literal `null`.
+
+    SuccessEnvelope:
+      type: object
+      required: [error, result]
+      properties:
+        error:
+          type: string
+          nullable: true
+          enum: [null]
+        result:
+          description: Operation-specific payload (may be `null`).
+
+    ErrorEnvelope:
+      type: object
+      required: [error, result]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+          example: Device ID does not exist
+        result:
+          description: Usually `null`.
+
+    NullResultEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            result:
+              $ref: '#/components/schemas/JsonNull'
+
+    TrueResultEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            result:
+              type: boolean
+              enum: [true]
+
+    MongoDeleteResult:
+      type: object
+      description: Raw MongoDB driver delete result; exact keys depend on the driver version.
+      properties:
+        acknowledged:
+          type: boolean
+        deletedCount:
+          type: integer
+        n:
+          type: integer
+        ok:
+          type: integer
+      additionalProperties: true
+
+    Credentials:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          example: partner-integration@example.com
+        password:
+          type: string
+          format: password
+
+    DeviceInput:
+      type: object
+      description: |-
+        A device (player) registration. Either `url` (partner presentation URL) or
+        `setupId` normally drives provisioning. Note the v1 provisioning rules only
+        redirect non-BSN devices that have **both** `url` and `username`.
+      required: [serial, username]
+      properties:
+        serial:
+          type: string
+          description: Player serial number. Upper-cased on create. Globally unique.
+          example: D7E89K000123
+        username:
+          type: string
+          description: End-user e-mail address associated with the device.
+          example: user@example.com
+        NetworkName:
+          type: string
+          description: Required only when the caller is a configured BSN client account.
+          example: mynetwork
+        name:
+          type: string
+          example: Lobby display
+        model:
+          type: string
+          description: Player model. Upper-cased on create.
+          example: XT1144
+        desc:
+          type: string
+          example: Lobby, north wall
+        customization:
+          type: string
+        setupId:
+          $ref: '#/components/schemas/ObjectId'
+        setupName:
+          type: string
+          description: Set by the server from `setupId`; on PUT may be used to look up `setupId`.
+        url:
+          type: string
+          description: Partner presentation URL the player downloads `autorun.zip` from.
+          example: https://cms.example.com/bdeploy/autorun.zip
+        userdata:
+          type: string
+          maxLength: 1024
+          description: Sent by the player as the `UserData` header when fetching `url`.
+        client:
+          type: string
+          description: Ignored on input; always set to the caller's username in v1.
+          readOnly: true
+
+    DeviceUpdate:
+      allOf:
+        - $ref: '#/components/schemas/DeviceInput'
+        - type: object
+          required: [_id]
+          properties:
+            _id:
+              $ref: '#/components/schemas/ObjectId'
+
+    Device:
+      type: object
+      description: A stored device record. `setupId` is never present in GET responses.
+      properties:
+        _id:
+          $ref: '#/components/schemas/ObjectId'
+        client:
+          type: string
+          description: Owning API client. In v1 this is the creating user's username.
+        NetworkName:
+          type: string
+        username:
+          type: string
+        serial:
+          type: string
+        name:
+          type: string
+        model:
+          type: string
+        desc:
+          type: string
+        customization:
+          type: string
+        setupName:
+          type: string
+        url:
+          type: string
+        userdata:
+          type: string
+        activationCode:
+          type: string
+          description: Present only while a player activation code is outstanding.
+        activationCodeExpirationDate:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        __v:
+          type: integer
+          description: Mongoose document version.
+
+    DeviceList:
+      type: object
+      required: [total, matched, players, priv]
+      properties:
+        total:
+          type: integer
+          description: Number of records owned by the caller (all pages).
+        matched:
+          type: integer
+          description: Number of records matching the filter (all pages).
+        players:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+        priv:
+          type: string
+          enum: [admin, user]
+
+    DeviceSetupV1Input:
+      type: object
+      description: |-
+        v1 device setup (PascalCase, BrightAuthor-era model). Only `username` is
+        unconditionally required. When the caller is a configured BSN client account (or
+        `setupType` is `bsn`), `NetworkName`, `PackageName`, `Name`, `Description`, and
+        either `Login`+`Password` or a complete `bsnDeviceRegistrationTokenEntity` are
+        also required.
+      required: [username]
+      properties:
+        NetworkName:
+          type: string
+        username:
+          type: string
+          description: End-user e-mail address.
+        PackageName:
+          type: string
+          description: Must be unique per `client` + `NetworkName`.
+        Login:
+          type: string
+        Password:
+          type: string
+          format: password
+        Name:
+          type: string
+          description: Unit (device) name.
+        Description:
+          type: string
+        ConcatUnitNameAndSerial:
+          type: boolean
+        TargetGroupName:
+          type: string
+        TargetBrightWallName:
+          type: string
+        TargetBrightWallScreenNumber:
+          type: number
+        Model:
+          type: string
+        TargetTimeZone:
+          type: string
+          example: PST
+        ScreenColor:
+          type: string
+          example: 'RGB:000000'
+        SplashScreenUrl:
+          type: string
+          description: Downloaded by the server and embedded in the setup package.
+        ContentCheckPeriod:
+          type: string
+          description: .NET TimeSpan string.
+          example: '1.00:00:00'
+        ContentDownloadsEndTime:
+          type: string
+        ContentDownloadsStartTime:
+          type: string
+        HealthReportingPeriod:
+          type: string
+        HealthReportingEndTime:
+          type: string
+        HealthReportingStartTime:
+          type: string
+        NetworkSettings:
+          $ref: '#/components/schemas/NetworkSettingsV1'
+        Beacons:
+          type: array
+          items:
+            $ref: '#/components/schemas/BeaconV1'
+        RemoteSnapshotSettings:
+          type: object
+          properties:
+            Enabled:
+              type: boolean
+            CaptureInterval:
+              type: string
+              example: '00:15:00'
+            CountLimit:
+              type: number
+            ImageQuality:
+              type: number
+            ScreenOrientation:
+              type: string
+              example: Landscape
+        LogsSettings:
+          type: object
+          properties:
+            EnableDiagnosticLog:
+              type: boolean
+            EnableEventLog:
+              type: boolean
+            EnablePlaybackLog:
+              type: boolean
+            EnableStateLog:
+              type: boolean
+            EnableVariableLog:
+              type: boolean
+            UploadAtBoot:
+              type: boolean
+            UploadTime:
+              type: string
+        LocalWebServerSettings:
+          type: object
+          properties:
+            Enabled:
+              type: boolean
+            EnableUpdateNotifications:
+              type: boolean
+            UserName:
+              type: string
+            Password:
+              type: string
+        DiagnosticWebServerSettings:
+          type: object
+          properties:
+            Enabled:
+              type: boolean
+            Password:
+              type: string
+        EnableNetworkDiagnostics:
+          type: boolean
+        EnableEthernetTest:
+          type: boolean
+        EnableWirelessTest:
+          type: boolean
+        EnableInternetTest:
+          type: boolean
+        FirmwareVersion:
+          type: string
+          description: |-
+            A semantic version (`x.y.z`) or one of `Production`, `Beta`,
+            `MinimumCompatible`. Ignored when `FirmwareURL` is set.
+        FirmwareURL:
+          type: string
+          description: Direct URL to a `.bsfw` firmware file.
+        bsnDeviceRegistrationTokenEntity:
+          $ref: '#/components/schemas/RegistrationTokenV1'
+        setupType:
+          type: string
+          description: Only consulted for validation (`bsn` triggers BSN rules); not part of the stored schema.
+
+    DeviceSetupV1Update:
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV1Input'
+        - type: object
+          required: [_id]
+          properties:
+            _id:
+              $ref: '#/components/schemas/ObjectId'
+
+    DeviceSetupV1:
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV1Input'
+        - type: object
+          properties:
+            _id:
+              $ref: '#/components/schemas/ObjectId'
+            client:
+              type: string
+              description: Username of the creating API account.
+            createdAt:
+              type: string
+              format: date-time
+            updatedAt:
+              type: string
+              format: date-time
+            __v:
+              type: integer
+
+    DeviceSetupV1List:
+      type: object
+      required: [total, matched, deviceSetups, priv]
+      properties:
+        total:
+          type: integer
+          description: Setups owned by the caller.
+        matched:
+          type: integer
+          description: Setups matching the filter (all pages).
+        deviceSetups:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceSetupV1'
+        priv:
+          type: string
+          enum: [admin, user]
+
+    NetworkSettingsV1:
+      type: object
+      properties:
+        Hostname:
+          type: string
+        ProxyServer:
+          type: string
+        ProxyBypass:
+          type: array
+          items:
+            type: string
+        TimeServer:
+          type: string
+        WiredConnectionPriority:
+          type: boolean
+        WirelessConnectionPriority:
+          type: boolean
+        Wired:
+          $ref: '#/components/schemas/WiredV1'
+        Wireless:
+          $ref: '#/components/schemas/WirelessV1'
+
+    WiredV1:
+      type: object
+      properties:
+        UseDHCP:
+          type: boolean
+        IpAddress:
+          type: string
+        SubnetMask:
+          type: string
+        DefaultGateway:
+          type: string
+        DNS1:
+          type: string
+        DNS2:
+          type: string
+        DNS3:
+          type: string
+        RateLimitDuringInitialDownloads:
+          type: number
+        RateLimitInsideContentDownloadWindow:
+          type: number
+        RateLimitOutsideContentDownloadWindow:
+          type: number
+        ContentDownloadEnabled:
+          type: boolean
+        TextFeedsDownloadEnabled:
+          type: boolean
+        MediaFeedsDownloadEnabled:
+          type: boolean
+        HealthReportingEnabled:
+          type: boolean
+        LogsUploadEnabled:
+          type: boolean
+
+    WirelessV1:
+      allOf:
+        - $ref: '#/components/schemas/WiredV1'
+        - type: object
+          properties:
+            Enabled:
+              type: boolean
+            SSID:
+              type: string
+            Passphrase:
+              type: string
+
+    BeaconV1:
+      type: object
+      properties:
+        Mode:
+          type: string
+          example: iBeacon
+        Name:
+          type: string
+        UUID:
+          type: string
+        NamespaceID:
+          type: string
+        InstanceID:
+          type: string
+        Major:
+          type: number
+        Minor:
+          type: number
+        PowerLevel:
+          type: number
+        URL:
+          type: string
+
+    RegistrationTokenV1:
+      type: object
+      description: BSN.cloud device registration token embedded in the setup.
+      properties:
+        token:
+          type: string
+        scope:
+          type: string
+          example: cert
+        validFrom:
+          type: string
+          description: ISO 8601 date-time (stored as a string).
+        validTo:
+          type: string
+          description: ISO 8601 date-time (stored as a string).
+
+security:
+  - BearerJwtV1: []

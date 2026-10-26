@@ -1,0 +1,2612 @@
+openapi: 3.0.3
+info:
+  title: B-Deploy Provisioning API v2 / v3
+  version: 2.0.0
+  description: |-
+    Current B-Deploy provisioning API, authenticated with BSN.cloud OAuth2 access tokens.
+
+    | Resource | Path prefix | Service |
+    |---|---|---|
+    | Devices (player registrations) | `/rest-device/v2` | PVS |
+    | Setups, setup schema 2.0.0 | `/rest-setup/v2` | PSS |
+    | Setups, setup schema 3.0.0 | `/rest-setup/v3` | PSS |
+
+    There is no `/rest-device/v3`; v3 changed only the setup schema (adds the
+    multi-interface `network` object). Device v2 is used with either setup version.
+    The gateway strips the `/rest-device` and `/rest-setup` prefixes before routing.
+
+    ## Authentication and network context
+    Send a BSN.cloud access token as `Authorization: Bearer <token>`
+    (e.g. OAuth2 client-credentials from
+    `https://auth.bsn.cloud/realms/bsncloud/protocol/openid-connect/token`).
+    B-Deploy resolves the caller's **network from the token's BSN.cloud user session**,
+    not from the request. Before calling B-Deploy, select the network with the BSN.cloud
+    Main API: `PUT https://api.bsn.cloud/2022/06/REST/Self/Session/Network`
+    with body `{"name": "<network>"}`. A token with no session network is rejected with
+    401 (`{"error":"Unauthorized","result":null}` on devices,
+    `{"error":"Error: Invalid token","result":null}` on setups) by the Node services, and
+    with 403 by the C# service. Tokens carrying the `bsn.pxs.admin` scope bypass network
+    scoping on devices (both implementations) and on setups (C# only).
+
+    ## Response envelope
+    Every JSON response is `{"error": <string|null>, "result": <any>}`. When the server
+    fails without setting a status explicitly the status is **500**, even for some client
+    mistakes (documented per operation).
+
+    ## Identifiers
+    Treat ids as opaque strings. Records created by the Node services have MongoDB
+    ObjectIds (24 hex characters); records created by the C# provisioning service have
+    decimal integer strings (e.g. `"1234"`). Migrated records keep their ObjectId.
+
+    ## Two implementations
+    These routes are served by the original Node services (PVS/PSS) or by their C# port
+    (`BSN.Cloud.Hosts.API.Provisioning`). The C# gateway route on `develop` sends all
+    v2/v3 paths to C# in every environment; whether production has been deployed with it
+    cannot be confirmed from source. The success
+    shapes in this document are common to both. Portable clients should:
+
+    * branch on HTTP status class and the `error` field, not on exact 4xx codes — the
+      implementations differ on several (400 vs 404 vs 403; full list in
+      `docs/IMPLEMENTATION-NOTES.md`);
+    * accept non-envelope error bodies from the C# service: authentication/authorization
+      failures can be 401/403 with an **empty** body, and framework validation failures
+      (missing required query parameter, malformed JSON, wrong content type) return
+      RFC 7807 `application/problem+json`;
+    * always send `pageSize` explicitly (default is 100 in Node, 50 in C#);
+    * on device PUT, send the complete record including `_id` and `serial` (Node replaces
+      the record and requires `_id`; C# merges present keys and looks up by `serial`);
+    * on setup list requests, always name the network (Node requires it);
+    * send `Content-Type: application/json` exactly (Node's setup service rejects a
+      charset parameter).
+
+    ## Query-string filters
+    List operations accept legacy flat parameters (`pageNum`, `pageSize`, `NetworkName`,
+    `account`, `username`, ...) **and** bracketed `qs`-style objects:
+    `query[<field>]=`, `sort[<field>]=`, `page[pageNum]=`, `page[pageSize]=`.
+    Bracketed values win on conflict. Numeric-looking values are converted to numbers and
+    `true`/`false`/`null` to literals. Flat parameters other than those listed per
+    operation are **ignored** (e.g. a flat `packageName` does not filter setups; use
+    `query[packageName]`).
+
+    ## Source of truth
+    Derived from `bsn-core/provisioning-server` (PVS `server/api-utils-v2.js`, PSS
+    `external/pss/pss-server/api-utils-v2.js`, `api-utils-v3.js`), the C# port
+    `BSN.Cloud.Hosts.API.Provisioning` (bsn-cloud-inherited, `develop`), and the
+    `gopurple` SDK. Known defects and Node/C# differences are listed in
+    `docs/IMPLEMENTATION-NOTES.md`.
+  contact:
+    name: BrightSign
+    url: https://www.brightsign.biz
+servers:
+  - url: https://provision.bsn.cloud
+    description: Production
+  - url: https://provision.bsn-staging.net
+    description: Staging
+  - url: https://provision.bsn-qa.net
+    description: QA
+  - url: https://provision.bsn-dev.net
+    description: Development
+tags:
+  - name: Devices
+    description: Player registrations — PVS, `/rest-device/v2`.
+  - name: Setups v3
+    description: Setup records using setup schema 3.0.0 — PSS, `/rest-setup/v3`. Recommended.
+  - name: Setups v2
+    description: Setup records using setup schema 2.0.0 — PSS, `/rest-setup/v2`.
+  - name: Applications
+    description: Partner application catalogue.
+  - name: Internal
+    description: Service-to-service, support, or BrightSign-UI endpoints. Not for partner use.
+  - name: Player protocol
+    description: |-
+      Endpoints called by BrightSign players during provisioning. They require the
+      player's mTLS client certificate (the gateway forwards it as
+      `x-forwarded-client-cert`); API clients cannot call them.
+paths:
+  /rest-device/v2/device:
+    get:
+      tags: [Devices]
+      operationId: getDevices
+      summary: Get one device by id, or query devices in the caller's network
+      description: |-
+        * `_id` present: returns the single device **object** (not a list) — or `null` if
+          it belongs to a different network than the token. 404 if the id does not exist.
+        * Otherwise at least one filter is required (`serial`, `NetworkName`/`account`,
+          `username`, `setupId`, `model`, or any `query[...]` field such as
+          `query[setupName]`). With no filter the result is an empty list.
+        * Results are restricted to the token's network. A `NetworkName` filter different
+          from the token's network yields an empty list (not 403).
+        * If the filtered query matches nothing and `serial` was given, the server looks the
+          serial up on its own and returns it (0 or 1 items) if it is in the caller's
+          network — this also finds records that have no `NetworkName` yet.
+        * `username` is a case-insensitive prefix match; other filters are exact.
+
+        `setupId` is **never returned** in device GET responses (the server strips it).
+        Use `setupName` (stored when the device is associated) to see the association.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQueryOptional'
+        - $ref: '#/components/parameters/SerialQuery'
+        - $ref: '#/components/parameters/NetworkNameQuery'
+        - $ref: '#/components/parameters/AccountQuery'
+        - $ref: '#/components/parameters/UsernameQuery'
+        - $ref: '#/components/parameters/SetupIdQuery'
+        - $ref: '#/components/parameters/ModelQuery'
+        - $ref: '#/components/parameters/PageNumQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+        - $ref: '#/components/parameters/DeviceQueryObject'
+        - $ref: '#/components/parameters/SortObject'
+        - $ref: '#/components/parameters/PageObject'
+      responses:
+        '200':
+          description: A `DeviceList`, or a single `Device` / `null` when `_id` is given.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/DeviceList'
+                          - $ref: '#/components/schemas/Device'
+                          - $ref: '#/components/schemas/JsonNull'
+              examples:
+                list:
+                  value:
+                    error: null
+                    result:
+                      total: 1
+                      matched: 1
+                      priv: user
+                      players:
+                        - _id: 689fcb2d03af0e3de789c742
+                          client: my-oauth-client-id
+                          NetworkName: mynetwork
+                          username: user@example.com
+                          serial: UTD416000978
+                          name: Lobby
+                          model: XT1144
+                          desc: ''
+                          setupName: Lobby setup
+                          createdAt: '2026-03-02T10:15:00.000Z'
+                          updatedAt: '2026-03-02T10:20:00.000Z'
+                          __v: 0
+        '400':
+          description: Invalid `_id`, `pageNum` < 1, `pageSize` outside 1-100, invalid `serial`, or malformed Authorization header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '`_id` given but no such device ("Device ID does not exist").'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    post:
+      tags: [Devices]
+      operationId: createDevices
+      summary: Register one or more devices
+      description: |-
+        Body is a single `DeviceInput` or an array.
+
+        * `client`: if omitted (or the BrightSign UI client id), set to the token's OAuth
+          client id (`azp`).
+        * `serial` and `model` are upper-cased on create. `serial` is globally unique: if any
+          record with the serial already has a `NetworkName`, the request fails with
+          400 "Player already exists" — delete it first.
+        * A record that exists only because the player requested an activation code (no
+          `NetworkName` yet) is completed in place.
+        * POST never updates a registered device: any record with a `NetworkName` hits the
+          "Player already exists" check first. Use PUT to change a device.
+        * When `setupId` is given the server stores the setup's package name as `setupName`.
+
+        Additional rules enforced only by the C# service: `NetworkName` must equal the
+        token's network (403 otherwise; the server sets it from the token when omitted);
+        `serial` must be 12 characters without whitespace; a new record must have
+        `setupId` or `url`; `username`/`client` are taken from the token; all element
+        errors are reported together, joined by `"; "`. Send `NetworkName`, a valid serial
+        and a `setupId` or `url` to be portable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/DeviceInput'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/DeviceInput'
+            example:
+              serial: UTD416000978
+              username: user@example.com
+              NetworkName: mynetwork
+              name: Lobby
+              setupId: 6917e8cf04cd25f13c883f51
+      responses:
+        '201':
+          description: '`result` is the device id for a single-object body, or an array of ids for an array body.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/Id'
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/Id'
+              example:
+                error: null
+                result: 689fcb2d03af0e3de789c742
+        '400':
+          description: |-
+            "Serial is required", "Username is required", "Network name is required" (BSN
+            clients), "Player already exists", duplicate key, or "Invalid device: ..."
+            (e.g. `userdata` longer than 1024 characters).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    put:
+      tags: [Devices]
+      operationId: updateDevice
+      summary: Replace a device record
+      description: |-
+        **Full replacement**, not a merge: the stored record is deleted and the body saved
+        under the same `_id`; omitted fields are lost, and `createdAt` is reset unless the
+        body sends it back. Read the
+        record first and send it back complete.
+
+        * `_id` in the body is required and must exist (an `_id` query parameter is
+          ignored).
+        * The record is located by the body's `serial`, so `serial` is required.
+        * 403 if the existing record belongs to a different network than the token.
+        * `client` follows the same defaulting rule as POST.
+        * To associate a setup, send `setupId`; or omit `setupId` and send `setupName` plus
+          `NetworkName` and the server resolves the id if exactly one setup matches.
+
+        C# service differences: the record is looked up by `serial` (`_id` optional, but
+        must match if given); only the keys present are applied (merge, not replace);
+        `NetworkName` cannot be changed once set; an unknown serial is created (201) when
+        the caller may create devices.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceUpdate'
+      responses:
+        '200':
+          description: Updated. `result` is `null`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullResultEnvelope'
+        '201':
+          description: C# service only — serial was unknown and the device was created; `result` is the new id.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/Id'
+        '400':
+          description: 'Missing/invalid `_id`, "Device doesn''t exist: <serial>", or "Invalid device: ...".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '"Token belongs to different network than the player to be updated".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: '"Device ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    delete:
+      tags: [Devices]
+      operationId: deleteDevice
+      summary: Delete a device by id or serial
+      description: Deletes by `_id` if given, otherwise by `serial`.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQueryOptional'
+        - $ref: '#/components/parameters/SerialQuery'
+      responses:
+        '200':
+          description: Deleted. `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: '"Missing ID or Serial number", or invalid `_id`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '"Token belongs to different network than the player to be deleted".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: '"Device ID does not exist" or "Serial number does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/device/{_id}:
+    get:
+      tags: [Devices]
+      operationId: getDeviceById
+      summary: Get a device by id
+      description: |-
+        Returns the device object, or `result: null` (200) when the device belongs to a
+        different network than the token. `setupId` is stripped from the response.
+        This operation is `GET`; there is no `POST` on this path.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdPath'
+      responses:
+        '200':
+          description: The device, or `null`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/Device'
+                          - $ref: '#/components/schemas/JsonNull'
+        '400':
+          description: Invalid id format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '"Device ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/device/ids/{idarray}:
+    delete:
+      tags: [Devices]
+      operationId: deleteDevicesByIds
+      summary: Bulk delete devices
+      description: |-
+        Deletes the listed devices that belong to the token's network; others are reported
+        in `failedIds`. Always 200 once the array is valid — inspect the result.
+      parameters:
+        - $ref: '#/components/parameters/IdArrayPath'
+      responses:
+        '200':
+          description: Per-id outcome.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/BulkDeleteResult'
+        '400':
+          description: |-
+            "Invalid IDS: ..." when an entry is not a string. A malformed, non-array or
+            empty array gives a non-JSON 500 on Node (defect), "Invalid Device ID array" on C#.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rest-setup/v3/setup:
+    get:
+      tags: [Setups v3]
+      operationId: getSetupsV3
+      summary: List setup records, or get one setup by `_id`
+      description: |-
+        Two different response shapes:
+
+        * **`_id` present** (Node only) → `result` is an array with one element: the setup
+          itself (`DeviceSetup`, the parsed `setupJson`), converted to schema 3.0.0 if it
+          was stored as 2.0.0. 404 with `result: null` if not found. The C# service ignores
+          `?_id=` and returns the network's record list, so portable clients must use
+          `GET /rest-setup/v3/setup/{_id}`.
+        * **otherwise** → `result` is an array of stored **records**
+          (`DeviceSetupRecord`), each carrying the setup as a JSON **string** in
+          `setupJson`. Non-admin callers must name their network
+          (`NetworkName`, `account`, or `query[networkName]`) and it must equal the token's
+          network; either violation returns **400** (Node). The C# service scopes to the
+          token's network automatically and returns 403 on a mismatch.
+
+        Filter with `query[packageName]`, `query[setupType]`, `query[username]` (prefix,
+        case-insensitive), `query[bsnGroupName]`, `query[deviceName]`,
+        `query[deviceDescription]`, `query[client]`. Sort with `sort[<field>]=1|-1`.
+        Alternatively pass all of `query`/`sort`/`page` as base64-encoded JSON in
+        `filter`.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdQueryOptional'
+        - $ref: '#/components/parameters/SetupNetworkNameQuery'
+        - $ref: '#/components/parameters/AccountQuery'
+        - $ref: '#/components/parameters/SetupUsernameQuery'
+        - $ref: '#/components/parameters/PageNumQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+        - $ref: '#/components/parameters/SetupQueryObject'
+        - $ref: '#/components/parameters/SortObject'
+        - $ref: '#/components/parameters/PageObject'
+        - $ref: '#/components/parameters/Base64Filter'
+      responses:
+        '200':
+          description: See description for the two shapes.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/DeviceSetupRecord'
+                          - type: array
+                            minItems: 1
+                            maxItems: 1
+                            items:
+                              $ref: '#/components/schemas/DeviceSetupV3'
+        '400':
+          description: |-
+            "networkName is required in the request query", "networkName of token and query
+            do not match", invalid id, or invalid paging.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SetupNotFound'
+    post:
+      tags: [Setups v3]
+      operationId: createSetupsV3
+      summary: Create one or more setups (schema 3.0.0)
+      description: |-
+        Body is a `DeviceSetupV3Input` or an array of them.
+
+        Processing, in order:
+        1. The body is shallow-merged over the server's default setup template (so omitted
+           top-level fields take defaults — `version` "3.0.0", `setupType` "standalone",
+           `bsnGroupName` "Default", a DHCP `eth0` `network`, ...). Nested objects you send
+           (e.g. `bDeploy`, `network`) replace the default object entirely.
+        2. `bDeploy.client`: if absent or the BrightSign UI client id, set to the token's
+           OAuth client id (Node). The C# service sets an absent value to
+           `"default-client"`, so send `bDeploy.client` explicitly if you rely on it.
+        3. Validation (400 on failure): `bDeploy.username`, `bDeploy.networkName` and
+           `bDeploy.packageName` present; `setupType` one of the allowed values;
+           `bsnGroupName` must not start or end with whitespace or `.`; `bDeploy.url`, if
+           present, must be an absolute URL; `version` major must be 3 and `network` a
+           non-empty object; for `setupType` `bsn`, `bsnDeviceRegistrationTokenEntity`
+           with `token`, `scope`, `validFrom`, `validTo` is required.
+        4. `bDeploy.packageName` must be unique within the network.
+
+        The stored setup's `_id` is written back into the setup JSON. The C# service also
+        rejects a `bDeploy.networkName` different from the token's network (403).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/DeviceSetupV3Input'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/DeviceSetupV3Input'
+            example:
+              version: 3.0.0
+              setupType: partnerApplication
+              bDeploy:
+                username: user@example.com
+                networkName: mynetwork
+                packageName: Lobby setup
+                url: https://cms.example.com/bdeploy/autorun.zip
+              deviceName: Lobby
+              timeZone: PST
+              bsnGroupName: Default
+              network:
+                timeServers: ['http://time.bsn.cloud']
+                interfaces:
+                  - id: wired_eth0
+                    name: eth0
+                    type: Ethernet
+                    proto: DHCPv4
+                    ip: []
+                    dns: []
+                    contentDownloadEnabled: true
+                    healthReportingEnabled: true
+      responses:
+        '201':
+          description: '`result` is the new setup id, or an array of ids when an array with more than one element was posted.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/Id'
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/Id'
+              example:
+                error: null
+                result: 6917e8cf04cd25f13c883f51
+        '400':
+          description: 'Validation failure, e.g. "Invalid setup: Error: Package name is required", "Invalid setup: Setup package name must be unique".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeStrict'
+        '500':
+          description: Body without `bDeploy.username` (unhandled server exception).
+    put:
+      tags: [Setups v3]
+      operationId: updateSetupV3
+      summary: Replace a setup (schema 3.0.0)
+      description: |-
+        Replaces the stored setup JSON with the body **as sent** — on Node, unlike POST, no
+        defaults are merged, so send the complete setup (typically: GET it, modify, PUT it
+        back). The C# service merges top-level defaults on PUT too, and overwrites
+        `bDeploy.networkName` with the token's network.
+        `_id` in the body is required and must exist. Same validation as POST except the
+        package-name uniqueness check (the C# service checks uniqueness on update too, and
+        selects 2.0.0 vs 3.0.0 rules from the body's `version` rather than the route).
+        `bDeploy.client` is defaulted as on POST. The result is not the updated setup;
+        re-read it if needed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceSetupV3Update'
+      responses:
+        '200':
+          description: Updated. `result` is the MongoDB update result (not the setup).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/MongoUpdateResult'
+        '400':
+          description: Missing/invalid `_id`, "Device Setup doesn't exist", or validation failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeStrict'
+    delete:
+      tags: [Setups v3]
+      operationId: deleteSetupV3
+      summary: Delete a setup
+      description: |-
+        The id must be passed as the `_id` **query** parameter (`/setup?_id=...` or
+        `/setup/?_id=...`); `DELETE /setup/{_id}` is not routed.
+
+        Fails with **500** "Error: Cannot delete device setup because it is in use" while any
+        device still references the setup — delete or re-associate those devices first.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdQueryRequired'
+      responses:
+        '200':
+          description: Deleted. `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: Missing/invalid `_id`, or "Device Setup doesn't exist" (e.g. a v1 setup id).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '"Token belongs to different network than the setup to be deleted".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Setup in use by at least one device, or the in-use check failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v3/setup/{_id}:
+    get:
+      tags: [Setups v3]
+      operationId: getSetupByIdV3
+      summary: Get one setup (schema 3.0.0)
+      description: |-
+        Returns an **array containing one** `DeviceSetupV3` (2.0.0 setups are converted to
+        3.0.0 on the fly, deriving `network` from the legacy flat fields). Not found →
+        404 with `result: null`.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          description: One-element array.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: array
+                        minItems: 1
+                        maxItems: 1
+                        items:
+                          $ref: '#/components/schemas/DeviceSetupV3'
+        '400':
+          description: Malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SetupNotFound'
+
+  /rest-setup/v3/setup-package/{_id}:
+    get:
+      tags: [Setups v3]
+      operationId: downloadSetupPackageV3
+      summary: Download the generated setup package
+      description: Builds the setup package (the files a player installs from `autorun.zip`) and streams it as a ZIP attachment.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/ZipPackage'
+        '400':
+          description: Invalid id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Package generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/setup:
+    get:
+      tags: [Setups v2]
+      operationId: getSetupsV2
+      summary: List setup records, or get one setup by `_id` (schema 2.0.0)
+      description: |-
+        Identical to `GET /rest-setup/v3/setup` except that a single setup returned via
+        `_id` is converted **down** to schema 2.0.0 (`version` "2.0.0", `network`
+        removed), and the id is validated first (400 invalid / 404 unknown).
+      parameters:
+        - $ref: '#/components/parameters/SetupIdQueryOptional'
+        - $ref: '#/components/parameters/SetupNetworkNameQuery'
+        - $ref: '#/components/parameters/AccountQuery'
+        - $ref: '#/components/parameters/SetupUsernameQuery'
+        - $ref: '#/components/parameters/PageNumQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+        - $ref: '#/components/parameters/SetupQueryObject'
+        - $ref: '#/components/parameters/SortObject'
+        - $ref: '#/components/parameters/PageObject'
+        - $ref: '#/components/parameters/Base64Filter'
+      responses:
+        '200':
+          description: Array of records, or a one-element array holding the setup.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/DeviceSetupRecord'
+                          - type: array
+                            minItems: 1
+                            maxItems: 1
+                            items:
+                              $ref: '#/components/schemas/DeviceSetupV2'
+        '400':
+          description: Missing/mismatched network, invalid id, or invalid paging.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SetupNotFound'
+    post:
+      tags: [Setups v2]
+      operationId: createSetupsV2
+      summary: Create one or more setups (schema 2.0.0)
+      description: |-
+        As `POST /rest-setup/v3/setup`, except `version` must have major version 2 and is
+        therefore **required** (the server default is "3.0.0", which this endpoint
+        rejects). `network` is not validated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/DeviceSetupV2Input'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/DeviceSetupV2Input'
+      responses:
+        '201':
+          description: New id, or array of ids.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        oneOf:
+                          - $ref: '#/components/schemas/Id'
+                          - type: array
+                            items:
+                              $ref: '#/components/schemas/Id'
+        '400':
+          description: 'Validation failure, e.g. "Invalid setup: Error: API version v2 requires setup version to be 2.0.0".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeStrict'
+        '500':
+          description: Body without `bDeploy.username` (unhandled server exception).
+    put:
+      tags: [Setups v2]
+      operationId: updateSetupV2
+      summary: Replace a setup (schema 2.0.0)
+      description: As `PUT /rest-setup/v3/setup`, with `version` major 2 required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceSetupV2Update'
+      responses:
+        '200':
+          description: Updated. `result` is the MongoDB update result.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/MongoUpdateResult'
+        '400':
+          description: Missing/invalid `_id` or validation failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaTypeStrict'
+    delete:
+      tags: [Setups v2]
+      operationId: deleteSetupV2
+      summary: Delete a setup
+      description: Same behaviour as `DELETE /rest-setup/v3/setup`.
+      parameters:
+        - $ref: '#/components/parameters/SetupIdQueryRequired'
+      responses:
+        '200':
+          description: Deleted. `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: Missing/invalid `_id`, or setup not in the v2/v3 store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Setup belongs to a different network.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Setup in use by at least one device.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/setup/{_id}:
+    get:
+      tags: [Setups v2]
+      operationId: getSetupByIdV2
+      summary: Get one setup (schema 2.0.0)
+      description: Returns an array containing one `DeviceSetupV2` (3.0.0 setups are converted down by removing `network`).
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          description: One-element array.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: array
+                        minItems: 1
+                        maxItems: 1
+                        items:
+                          $ref: '#/components/schemas/DeviceSetupV2'
+        '400':
+          description: Invalid id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/SetupNotFound'
+
+  /rest-setup/v2/setup-package/{_id}:
+    get:
+      tags: [Setups v2]
+      operationId: downloadSetupPackageV2
+      summary: Download the generated setup package
+      parameters:
+        - $ref: '#/components/parameters/SetupIdPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/ZipPackage'
+        '400':
+          description: Invalid id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: '"Setup ID does not exist".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Package generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/application:
+    get:
+      tags: [Applications]
+      operationId: getPartnerApplications
+      summary: List partner applications
+      description: |-
+        Returns the partner-application catalogue sorted by `name`. With any filter
+        parameter present, only entries matching **all** given filters are returned:
+        `name` is a case-insensitive substring match, `url` a substring match,
+        `sortOrder`/`trialDuration` exact string matches, the rest case-insensitive exact
+        matches.
+      parameters:
+        - {name: name, in: query, required: false, schema: {type: string}}
+        - {name: id, in: query, required: false, schema: {type: string}}
+        - {name: type, in: query, required: false, schema: {type: string}}
+        - {name: skuId, in: query, required: false, schema: {type: string}}
+        - {name: netsuiteCrmId, in: query, required: false, schema: {type: string}}
+        - {name: sortOrder, in: query, required: false, schema: {type: string}}
+        - {name: trialDuration, in: query, required: false, schema: {type: string}}
+        - {name: partnerTier, in: query, required: false, schema: {type: string}}
+        - {name: url, in: query, required: false, schema: {type: string}}
+      responses:
+        '200':
+          description: The (filtered) catalogue.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: object
+                        properties:
+                          PartnerApplicationFile:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/PartnerApplication'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          description: Catalogue could not be loaded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/count-setups/{setupId}:
+    get:
+      tags: [Internal]
+      operationId: countDevicesUsingSetup
+      summary: Count devices referencing a setup (used by PSS before deleting a setup)
+      parameters:
+        - name: setupId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: '`result` is the count.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: integer
+                        minimum: 0
+        '400':
+          description: Invalid setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rest-device/v2/validate-activation-code:
+    get:
+      tags: [Internal]
+      operationId: validateActivationCode
+      summary: Validate a player activation code (BrightSign UI)
+      parameters:
+        - $ref: '#/components/parameters/ActivationCodeQuery'
+      responses:
+        '200':
+          description: Code is valid; `result` is the player serial.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: string
+                        example: UTD416000978
+        '400':
+          description: Missing, unknown, or expired code (`error` may be `null`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rest-device/v2/activation-code:
+    get:
+      tags: [Player protocol]
+      operationId: getActivationCode
+      summary: Issue (or return the current) activation code for a player
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - name: serial
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: '`result` is a 6-character upper-case alphanumeric code.'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      result:
+                        type: string
+                        pattern: '^[A-Z0-9]{6}$'
+        '304':
+          description: Player is already activated.
+        '400':
+          description: '"Invalid serial".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    delete:
+      tags: [Internal]
+      operationId: clearActivationCode
+      summary: Clear a player's activation code (BrightSign UI)
+      security:
+        - BsnOAuth2: []
+        - BsnBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ActivationCodeQuery'
+      responses:
+        '200':
+          description: Cleared; `result` is `true`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrueResultEnvelope'
+        '400':
+          description: Missing or unknown code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rest-device/v2/device/rma:
+    delete:
+      tags: [Internal]
+      operationId: rmaDeleteDevice
+      summary: RMA deletion of a device (and its setup if no longer used)
+      security:
+        - RmaToken: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdQueryOptional'
+        - $ref: '#/components/parameters/SerialQuery'
+        - {name: username, in: query, required: false, schema: {type: string}}
+        - {name: networkName, in: query, required: false, schema: {type: string}}
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '400':
+          description: Missing/invalid id or serial.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Unknown id or serial.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: 'Missing or wrong `api-rma-token` ("Error: Unauthorized"), or deletion failure.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/admin/device:
+    delete:
+      tags: [Internal]
+      operationId: adminDeleteDevice
+      summary: Support de-provisioning of a device (admin accounts only)
+      description: Requires `serial`, `username` and `NetworkName`; also deletes the setup when no other device uses it.
+      parameters:
+        - $ref: '#/components/parameters/SerialQuery'
+        - {name: username, in: query, required: true, schema: {type: string}}
+        - {name: NetworkName, in: query, required: true, schema: {type: string}}
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '400':
+          description: Missing parameters or no matching player.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: '"Error: Forbidden user".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/setup/rma:
+    delete:
+      tags: [Internal]
+      operationId: rmaDeleteSetup
+      summary: RMA deletion of a setup (called by PVS)
+      security:
+        - RmaToken: []
+      parameters:
+        - $ref: '#/components/parameters/SetupIdQueryRequired'
+      responses:
+        '200':
+          description: Deleted from the v2/v3 store, or from the v1 store as a fallback.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '400':
+          description: Missing or invalid `_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: '"Error: Invalid token".'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Unknown setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/:
+    get:
+      tags: [Player protocol]
+      operationId: playerEntry
+      summary: Player provisioning entry point
+      description: |-
+        First call a player makes. Applies the v1 rules (see the v1 spec); if none match
+        and the player runs BrightSignOS 8.0.0 or later (`DeviceFWVersion`), redirects
+        (301) to `/rest-device/v2`; otherwise 204.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/DeviceModelHeader'
+        - $ref: '#/components/parameters/DeviceFwVersionHeader'
+      responses:
+        '204':
+          description: Nothing to provision.
+        '301':
+          description: Redirect.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2:
+    get:
+      tags: [Player protocol]
+      operationId: playerEntryV2
+      summary: Player provisioning entry point (v2)
+      description: |-
+        Looks up the newest device record for the `DeviceID` serial.
+
+        * `isOOB: true` (out-of-box autorun) → 204.
+        * Record found, and it has `setupId` or `url` (or no activation code) → 301 to
+          `/rest-setup/v2/setup-script/device-object/<base64 device object>`.
+        * Otherwise, for supported player families on BrightSignOS ≥ 8.0.0 whose OS is
+          older than the manifest's minimum-compatible version → 200 with a BrightScript
+          that installs that firmware.
+        * Otherwise 204.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/DeviceModelHeader'
+        - $ref: '#/components/parameters/DeviceFamilyHeader'
+        - $ref: '#/components/parameters/DeviceFwVersionHeader'
+        - {name: isOOB, in: header, required: false, schema: {type: string, enum: ['true', 'false']}}
+      responses:
+        '200':
+          description: Firmware-update BrightScript.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '204':
+          description: Nothing to provision.
+        '301':
+          description: Redirect to the provisioning script.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-device/v2/runtime-script:
+    get:
+      tags: [Player protocol]
+      operationId: getRuntimeScriptBySerial
+      summary: Partner runtime (recovery) script, located by serial
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/StorageStatusHeader'
+      responses:
+        '200':
+          description: BrightScript that downloads `autorun.zip` from the device record's `url`.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '204':
+          description: Storage already holds an autorun.
+        '400':
+          description: Missing `DeviceID`, unknown serial, or the record has no `url`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Serial number does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/setup-script/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getProvisioningScriptV2
+      summary: BrightScript provisioning script
+      description: |-
+        Returns a BrightScript that downloads the setup package from
+        `/rest-setup/v2/setup-package/device-object/...` and, when the setup's
+        `firmwareUpdatesByFamily` entry for the player's family (or the forced minimum
+        OS policy) calls for it, a firmware file.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+      responses:
+        '200':
+          description: BrightScript source.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          description: Missing/invalid device object or setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Expired embedded token, non-semver firmware version, or generation failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/setup-package/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getSetupPackageForPlayerV2
+      summary: Setup package ZIP for a player
+      description: Refreshes the setup's registration token when within 25% of expiry (then waits 5 s), and returns the package.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+      responses:
+        '200':
+          $ref: '#/components/responses/ZipPackage'
+        '400':
+          description: Missing/invalid device object or setup id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: No client certificate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Token refresh or package generation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /rest-setup/v2/runtime-script/device-object/{deviceObject}:
+    get:
+      tags: [Player protocol]
+      operationId: getRuntimeScriptV2
+      summary: Partner runtime (recovery) script
+      description: The recovery URL written into partner setup packages. Downloads `autorun.zip` from the device object's `url`, sending `userdata` as the `UserData` header.
+      security:
+        - PlayerClientCertificate: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceObjectPath'
+        - $ref: '#/components/parameters/StorageStatusHeader'
+      responses:
+        '200':
+          description: BrightScript source.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '204':
+          description: Storage already holds an autorun.
+        '400':
+          description: Missing or invalid device object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+components:
+  securitySchemes:
+    BsnOAuth2:
+      type: oauth2
+      description: |-
+        BSN.cloud OAuth2. The token's BSN.cloud session must have a network selected
+        (`PUT https://api.bsn.cloud/2022/06/REST/Self/Session/Network`).
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.bsn.cloud/realms/bsncloud/protocol/openid-connect/token
+          scopes: {}
+    BsnBearer:
+      type: http
+      scheme: bearer
+      description: |-
+        A BSN.cloud access token obtained by any flow. JWTs are validated against the
+        BSN.cloud JWKS; opaque legacy tokens are introspected.
+    RmaToken:
+      type: apiKey
+      in: header
+      name: api-rma-token
+      description: Shared internal service token.
+    PlayerClientCertificate:
+      type: apiKey
+      in: header
+      name: x-forwarded-client-cert
+      description: Set by the gateway from the player's mTLS client certificate.
+
+  parameters:
+    DeviceIdPath:
+      name: _id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    SetupIdPath:
+      name: _id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    IdArrayPath:
+      name: idarray
+      in: path
+      required: true
+      description: URL-encoded JSON array of device ids.
+      schema:
+        type: string
+      example: '["689fcb2d03af0e3de789c742","689fcb2d03af0e3de789c743"]'
+    DeviceIdQueryOptional:
+      name: _id
+      in: query
+      required: false
+      description: Device id.
+      schema:
+        $ref: '#/components/schemas/Id'
+    SetupIdQueryOptional:
+      name: _id
+      in: query
+      required: false
+      description: Setup id. Changes the response shape on Node; ignored by the C# service (see operation description).
+      schema:
+        $ref: '#/components/schemas/Id'
+    SetupIdQueryRequired:
+      name: _id
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    SerialQuery:
+      name: serial
+      in: query
+      required: false
+      description: Player serial number (stored upper-case; exact match).
+      schema:
+        type: string
+      example: UTD416000978
+    NetworkNameQuery:
+      name: NetworkName
+      in: query
+      required: false
+      description: Must equal the token's network if given.
+      schema:
+        type: string
+      example: mynetwork
+    SetupNetworkNameQuery:
+      name: NetworkName
+      in: query
+      required: false
+      description: |-
+        Network to list. Required for non-admin list requests (unless `account` or
+        `query[networkName]` is given) and must equal the token's network.
+      schema:
+        type: string
+      example: mynetwork
+    AccountQuery:
+      name: account
+      in: query
+      required: false
+      description: Legacy alias for `NetworkName`.
+      schema:
+        type: string
+    UsernameQuery:
+      name: username
+      in: query
+      required: false
+      description: Case-insensitive prefix match.
+      schema:
+        type: string
+    SetupUsernameQuery:
+      name: username
+      in: query
+      required: false
+      description: Case-insensitive prefix match on the setup owner's username.
+      schema:
+        type: string
+    SetupIdQuery:
+      name: setupId
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/Id'
+    ModelQuery:
+      name: model
+      in: query
+      required: false
+      schema:
+        type: string
+      example: XT1144
+    PageNumQuery:
+      name: pageNum
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeQuery:
+      name: pageSize
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+      description: Default is 100 on the Node services and 50 on the C# service; send it explicitly.
+    DeviceQueryObject:
+      name: query
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: |-
+        Exact-match filters on device fields, e.g. `query[setupName]=Lobby%20setup`,
+        `query[NetworkName]=mynetwork`, `query[serial]=UTD416000978`.
+      schema:
+        type: object
+        additionalProperties:
+          type: string
+    SetupQueryObject:
+      name: query
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: |-
+        Filters on setup record fields: `networkName`, `packageName`, `setupType`,
+        `username` (prefix, case-insensitive), `bsnGroupName`, `deviceName`,
+        `deviceDescription`, `client`.
+      schema:
+        type: object
+        properties:
+          networkName:
+            type: string
+          packageName:
+            type: string
+          setupType:
+            $ref: '#/components/schemas/SetupType'
+          username:
+            type: string
+          bsnGroupName:
+            type: string
+          deviceName:
+            type: string
+          deviceDescription:
+            type: string
+          client:
+            type: string
+    SortObject:
+      name: sort
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      description: '`sort[<field>]=1` ascending or `-1` descending.'
+      schema:
+        type: object
+        additionalProperties:
+          type: integer
+          enum: [1, -1]
+    PageObject:
+      name: page
+      in: query
+      required: false
+      style: deepObject
+      explode: true
+      schema:
+        type: object
+        properties:
+          pageNum:
+            type: integer
+            minimum: 1
+          pageSize:
+            type: integer
+            minimum: 1
+            maximum: 100
+    Base64Filter:
+      name: filter
+      in: query
+      required: false
+      description: |-
+        Base64 of a JSON object `{"query":{...},"sort":{...},"page":{...}}`. Only
+        consulted when no bracketed `query`/`sort`/`page` parameter is present.
+      schema:
+        type: string
+        format: byte
+    ActivationCodeQuery:
+      name: code
+      in: query
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Z0-9]{6}$'
+    DeviceObjectPath:
+      name: deviceObject
+      in: path
+      required: true
+      description: Base64-encoded JSON device object generated by PVS.
+      schema:
+        type: string
+    DeviceIdHeader:
+      name: DeviceID
+      in: header
+      required: true
+      description: Player serial number.
+      schema:
+        type: string
+    DeviceModelHeader:
+      name: DeviceModel
+      in: header
+      required: false
+      schema:
+        type: string
+    DeviceFamilyHeader:
+      name: DeviceFamily
+      in: header
+      required: false
+      schema:
+        type: string
+    DeviceFwVersionHeader:
+      name: DeviceFWVersion
+      in: header
+      required: false
+      schema:
+        type: string
+    StorageStatusHeader:
+      name: StorageStatus
+      in: header
+      required: false
+      description: e.g. `usb1=none;sd=autorun;sd2=none;ssd=none;`
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: |-
+        Missing/invalid/expired token, or no BSN.cloud session network selected. A missing
+        or malformed `Authorization` header may instead return 400.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnsupportedMediaType:
+      description: '`Content-Type` is not `application/json`.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnsupportedMediaTypeStrict:
+      description: |-
+        `Content-Type` is not exactly `application/json`. The Node setup service rejects
+        parameters such as `; charset=utf-8`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    SetupNotFound:
+      description: 'Setup not found (`{"error": null, "result": null}`), or "Setup ID does not exist".'
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                nullable: true
+              result:
+                $ref: '#/components/schemas/JsonNull'
+    ZipPackage:
+      description: 'ZIP archive (`Content-Disposition: attachment`).'
+      headers:
+        Content-Disposition:
+          schema:
+            type: string
+            example: 'attachment; filename=k3j4h5g6.zip'
+      content:
+        application/zip:
+          schema:
+            type: string
+            format: binary
+
+  schemas:
+    Id:
+      type: string
+      description: Opaque record id. The Node services issue 24-hex-character MongoDB ObjectIds.
+      example: 6917e8cf04cd25f13c883f51
+
+    JsonNull:
+      type: object
+      nullable: true
+      enum: [null]
+      description: The JSON literal `null`.
+
+    SuccessEnvelope:
+      type: object
+      required: [error, result]
+      properties:
+        error:
+          type: string
+          nullable: true
+          enum: [null]
+        result:
+          description: Operation-specific payload (may be `null`).
+
+    ErrorEnvelope:
+      type: object
+      required: [error, result]
+      properties:
+        error:
+          type: string
+          description: Error message.
+          example: Device ID does not exist
+        result:
+          description: Usually `null`.
+
+    NullResultEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            result:
+              $ref: '#/components/schemas/JsonNull'
+
+    TrueResultEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            result:
+              type: boolean
+              enum: [true]
+
+    MongoUpdateResult:
+      type: object
+      description: MongoDB-style update result.
+      properties:
+        acknowledged:
+          type: boolean
+        modifiedCount:
+          type: integer
+        upsertedId:
+          type: string
+          nullable: true
+        upsertedCount:
+          type: integer
+        matchedCount:
+          type: integer
+      additionalProperties: true
+
+    BulkDeleteResult:
+      type: object
+      required: [deletedCount, deletedIds, failedIds, message]
+      properties:
+        deletedCount:
+          type: integer
+        deletedIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        failedIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        message:
+          type: string
+          enum:
+            - All players were deleted successfully
+            - Failed to delete players
+            - Some players were not deleted due to insufficient permissions
+
+    DeviceInput:
+      type: object
+      required: [serial, username]
+      properties:
+        serial:
+          type: string
+          description: Player serial number. Upper-cased on create; globally unique.
+          example: UTD416000978
+        username:
+          type: string
+          description: BSN.cloud user (e-mail) associated with the device.
+          example: user@example.com
+        NetworkName:
+          type: string
+          description: |-
+            BSN.cloud network. Strictly required only for BSN client accounts, but needed
+            in practice: network-scoped reads, updates and deletes compare it with the
+            token's network.
+          example: mynetwork
+        name:
+          type: string
+          description: Device name. Overrides the setup's `deviceName` in the generated package.
+        desc:
+          type: string
+          description: Device description. Overrides the setup's `deviceDescription`.
+        model:
+          type: string
+          description: Player model. Upper-cased on create.
+        customization:
+          type: string
+        setupId:
+          $ref: '#/components/schemas/Id'
+        setupName:
+          type: string
+          description: Setup package name. Set by the server from `setupId`; on PUT it can be used to resolve `setupId`.
+        url:
+          type: string
+          description: Partner presentation URL (alternative to `setupId`, or override of the setup's `bDeploy.url`).
+          example: https://cms.example.com/bdeploy/autorun.zip
+        userdata:
+          type: string
+          maxLength: 1024
+          description: Sent by the player as the `UserData` header when fetching `url`.
+        client:
+          type: string
+          description: Owning API client. Defaults to the token's OAuth client id.
+
+    DeviceUpdate:
+      allOf:
+        - $ref: '#/components/schemas/DeviceInput'
+        - type: object
+          required: [_id]
+          properties:
+            _id:
+              $ref: '#/components/schemas/Id'
+
+    Device:
+      type: object
+      description: Stored device record. `setupId` is never included in GET responses.
+      properties:
+        _id:
+          $ref: '#/components/schemas/Id'
+        client:
+          type: string
+        NetworkName:
+          type: string
+        username:
+          type: string
+        serial:
+          type: string
+        name:
+          type: string
+        model:
+          type: string
+        desc:
+          type: string
+        customization:
+          type: string
+        setupName:
+          type: string
+        url:
+          type: string
+        userdata:
+          type: string
+        activationCode:
+          type: string
+        activationCodeExpirationDate:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        __v:
+          type: integer
+
+    DeviceList:
+      type: object
+      required: [total, matched, players, priv]
+      properties:
+        total:
+          type: integer
+          description: |-
+            Not a reliable total. For non-admin callers it is the page's network-filtered
+            count plus counts of legacy records whose `client` equals the caller's
+            username.
+        matched:
+          type: integer
+          description: Number of `players` returned (this page, after network filtering).
+        players:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+        priv:
+          type: string
+          enum: [admin, user]
+
+    PartnerApplication:
+      type: object
+      description: Entry of the partner application manifest.
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          description: Returned (and filterable) by the Node service only; the C# service drops it.
+        url:
+          type: string
+        skuId:
+          type: string
+        netsuiteCrmId:
+          type: string
+        sortOrder:
+          type: integer
+        trialDuration:
+          type: integer
+        partnerTier:
+          type: string
+        partnerAddOnSKU:
+          type: array
+          items:
+            type: string
+        partnerSetupScreenUrl:
+          type: string
+        partnerLogoUrl:
+          type: string
+      additionalProperties: true
+
+    SetupType:
+      type: string
+      enum:
+        - standalone
+        - lfn
+        - legacyLfn
+        - sfn
+        - bsn
+        - localToBsn
+        - partnerApplication
+      description: |-
+        `standalone`, `lfn` (local file networking), `legacyLfn`, `sfn` (simple file
+        networking), `bsn` (BSN.cloud), `localToBsn`, `partnerApplication` (download
+        `bDeploy.url` / device `url`).
+
+    DeviceSetupRecord:
+      type: object
+      description: |-
+        A stored setup record as returned by list requests. The setup itself is the JSON
+        string in `setupJson`; the other fields are indexed copies.
+      properties:
+        _id:
+          $ref: '#/components/schemas/Id'
+        username:
+          type: string
+        client:
+          type: string
+        packageName:
+          type: string
+        setupType:
+          $ref: '#/components/schemas/SetupType'
+        networkName:
+          type: string
+        deviceName:
+          type: string
+        deviceDescription:
+          type: string
+        bsnGroupName:
+          type: string
+        version:
+          type: string
+          description: |-
+            On Node, reflects the requested API version for 2.x/3.x records (a 2.0.0 record
+            listed through `/v3` shows "3.0.0"), while `setupJson` keeps the stored version.
+            The C# service does the opposite: it converts `setupJson` and leaves `version`
+            as stored.
+        setupJson:
+          type: string
+          description: JSON-encoded `DeviceSetupV2` / `DeviceSetupV3`.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        __v:
+          type: integer
+
+    BDeploy:
+      type: object
+      required: [username, networkName, packageName]
+      properties:
+        username:
+          type: string
+          description: BSN.cloud user (e-mail). Stored lower-cased in the record.
+          example: user@example.com
+        networkName:
+          type: string
+          example: mynetwork
+        packageName:
+          type: string
+          description: Setup name; unique within the network.
+          example: Lobby setup
+        client:
+          type: string
+          description: Owning API client. Defaults to the token's OAuth client id.
+        url:
+          type: string
+          format: uri
+          description: Partner application URL; must be absolute if present.
+
+    RegistrationToken:
+      type: object
+      nullable: true
+      description: |-
+        BSN.cloud device registration token. Required (all four fields) for `setupType`
+        `bsn`. Create one with BSN.cloud `POST /2022/06/REST/Provisioning/Setups/Tokens/`.
+        The server renews it when a player downloads the package within the last 25% of
+        its lifetime.
+      properties:
+        token:
+          type: string
+        scope:
+          type: string
+          example: cert
+        validFrom:
+          type: string
+          format: date-time
+        validTo:
+          type: string
+          format: date-time
+
+    Color:
+      type: object
+      properties:
+        r: {type: integer, minimum: 0, maximum: 255}
+        g: {type: integer, minimum: 0, maximum: 255}
+        b: {type: integer, minimum: 0, maximum: 255}
+        a: {type: number, minimum: 0, maximum: 1}
+
+    PublishFirmware:
+      type: object
+      description: Firmware policy for one player family.
+      properties:
+        firmwareUpdateSource:
+          type: string
+          description: '`none` disables firmware delivery for the family; other values select production/beta/compatible/specific/existing firmware.'
+          example: none
+        firmwareUpdateSourceFilePath: {type: string}
+        firmwareUpdateSourceUrl: {type: string}
+        firmwareUpdateStandardTargetFileName: {type: string}
+        firmwareUpdateDifferentTargetFileName: {type: string}
+        firmwareUpdateNewerTargetFileName: {type: string}
+        firmwareUpdateSaveTargetFileName: {type: string}
+        firmwareUpdateVersion: {type: string}
+        productionReleaseURL: {type: string}
+        betaReleaseURL: {type: string}
+        compatibleReleaseURL: {type: string}
+        productionVersion: {type: string}
+        betaVersion: {type: string}
+        compatibleVersion: {type: string}
+        productionVersionNumber: {type: integer}
+        betaVersionNumber: {type: integer}
+        compatibleVersionNumber: {type: integer}
+        productionReleaseSHA1: {type: string}
+        betaReleaseSHA1: {type: string}
+        compatibleReleaseSHA1: {type: string}
+        productionReleaseFileLength: {type: integer}
+        betaReleaseFileLength: {type: integer}
+        compatibleReleaseFileLength: {type: integer}
+        existingFWContentID: {type: string}
+
+    WpaSettings:
+      type: object
+      properties:
+        enableWPAEnterpriseAuthentication: {type: boolean}
+        wpaEnterpriseVariant:
+          type: string
+          enum: [WPAEnterprisePeap, WPAEnterpriseEapTls]
+        eapCertificateType:
+          type: string
+          enum: [WPAEapTlsPKCS, WPAEapTlsPEMorDER]
+        eapCertificateFile:
+          $ref: '#/components/schemas/CaArtifact'
+        eapCertificatePassphrase: {type: string}
+        eapPemOrDerKeyFile:
+          $ref: '#/components/schemas/CaArtifact'
+        peapUsername: {type: string}
+        peapPassphrase: {type: string}
+        caCertificateFile:
+          $ref: '#/components/schemas/CaArtifact'
+
+    CaArtifact:
+      type: object
+      nullable: true
+      properties:
+        name: {type: string}
+        asset:
+          type: object
+          additionalProperties: true
+
+    NetworkInterface:
+      type: object
+      description: |-
+        One interface. `type` selects the variant: `Ethernet` (adds `showInUi`), `WiFi`
+        (adds `ssid`, `passphrase`, `security`), `Virtual` (VLAN; adds `vlanId`, `parent`),
+        `Cellular` (adds `modems`, `sims`; no IP fields).
+      required: [name, type]
+      properties:
+        id:
+          type: string
+          example: wired_eth0
+        name:
+          type: string
+          description: '`eth0`, `wlan0`, `usb0`, `ppp0`, or `<parent>.<vlanId>` for VLANs.'
+          example: eth0
+        type:
+          type: string
+          enum: [Ethernet, WiFi, Virtual, Cellular]
+        enabled:
+          type: boolean
+        metric:
+          type: integer
+          nullable: true
+        proto:
+          type: string
+          enum: [Static, DHCPv4, DHCPv6, NDP, Other]
+          default: DHCPv4
+        ip:
+          type: array
+          description: CIDR addresses for `Static`, e.g. `192.168.1.10/24`.
+          items:
+            type: string
+        gateway:
+          type: string
+          nullable: true
+        dns:
+          type: array
+          items:
+            type: string
+        rateLimitDuringInitialDownloads:
+          type: integer
+          nullable: true
+        rateLimitInsideContentDownloadWindow:
+          type: integer
+          nullable: true
+        rateLimitOutsideContentDownloadWindow:
+          type: integer
+          nullable: true
+        contentDownloadEnabled: {type: boolean}
+        textFeedsDownloadEnabled: {type: boolean}
+        mediaFeedsDownloadEnabled: {type: boolean}
+        healthReportingEnabled: {type: boolean}
+        logsUploadEnabled: {type: boolean}
+        wpaSettings:
+          $ref: '#/components/schemas/WpaSettings'
+        showInUi:
+          type: boolean
+          description: Ethernet only.
+        ssid:
+          type: string
+          description: WiFi only.
+        passphrase:
+          type: string
+          description: WiFi only.
+        security:
+          type: object
+          description: WiFi only.
+          properties:
+            authentication:
+              type: object
+              properties:
+                mode: {type: string, example: Shared}
+                passphrase: {type: string}
+                passphraseEdited: {type: boolean}
+            encryption:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [None, WEP, TKIP, CCMP, 'TKIP, CCMP', Other]
+        vlanId:
+          type: integer
+          description: Virtual only.
+        parent:
+          type: string
+          description: Virtual only; parent interface name.
+        modems:
+          type: array
+          description: Cellular only.
+          items:
+            type: object
+            properties:
+              model: {type: string}
+              usbDeviceIds:
+                type: array
+                items: {type: string}
+              usbModeSwitch: {type: string}
+              dataEndpoint: {type: string}
+              controlEndpoint: {type: string}
+              ignoreBlockDevice: {type: boolean}
+        sims:
+          type: array
+          description: Cellular only.
+          items:
+            type: object
+            properties:
+              mcc: {type: string}
+              mnc: {type: string}
+              connection:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    enum: [Default, dialUp]
+                  apn: {type: string}
+                  number: {type: string}
+                  username: {type: string}
+                  password: {type: string}
+
+    Network:
+      type: object
+      description: Setup schema 3.0.0 network configuration.
+      required: [interfaces]
+      properties:
+        timeServers:
+          type: array
+          items:
+            type: string
+          example: ['http://time.bsn.cloud']
+        hostname:
+          type: string
+          nullable: true
+        proxyServer:
+          type: string
+          nullable: true
+        proxyBypass:
+          type: array
+          nullable: true
+          items:
+            type: string
+        dns:
+          type: array
+          nullable: true
+          items:
+            type: string
+        interfaces:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/NetworkInterface'
+        certificateName:
+          type: string
+        certificateFile:
+          description: Certificate reference; a string, an empty object, or `null`.
+
+    DeviceSetupCommon:
+      type: object
+      description: Fields shared by setup schemas 2.0.0 and 3.0.0 (BrightSign `BsDsSetupParams`).
+      properties:
+        _id:
+          $ref: '#/components/schemas/Id'
+        version:
+          type: string
+          example: 3.0.0
+        bDeploy:
+          $ref: '#/components/schemas/BDeploy'
+        setupType:
+          $ref: '#/components/schemas/SetupType'
+        bsnGroupName:
+          type: string
+          default: Default
+          description: BSN.cloud group. Must not start or end with whitespace or `.`.
+        bsnDeviceRegistrationTokenEntity:
+          $ref: '#/components/schemas/RegistrationToken'
+        deviceName:
+          type: string
+        deviceDescription:
+          type: string
+        unitNamingMethod:
+          type: string
+          enum: [unitNameOnly, appendUnitIDToUnitName]
+          default: appendUnitIDToUnitName
+        timeZone:
+          type: string
+          default: PST
+        idleScreenColor:
+          $ref: '#/components/schemas/Color'
+        firmwareUpdatesByFamily:
+          type: object
+          description: Keyed by player family name (e.g. `Impala`, `Pantera`, `Malibu`, `Cobra`, `Thor`).
+          additionalProperties:
+            $ref: '#/components/schemas/PublishFirmware'
+        firmwareUpdateType:
+          type: string
+          enum: [standard, different, newer, save]
+          default: standard
+        enableSerialDebugging: {type: boolean}
+        enableSystemLogDebugging: {type: boolean}
+        remoteDwsEnabled: {type: boolean, default: true}
+        dwsEnabled: {type: boolean}
+        dwsPassword: {type: string}
+        dwsPasswordEdited: {type: boolean}
+        dwsPasswordPreviousSavedTimeStamp: {type: integer, format: int64}
+        lwsEnabled: {type: boolean, default: true}
+        lwsConfig:
+          type: string
+          enum: [content, status, none]
+          default: status
+        lwsUserName: {type: string}
+        lwsUsernameEdited: {type: boolean}
+        lwsPassword: {type: string}
+        lwsPasswordEdited: {type: boolean}
+        lwsEnableUpdateNotifications: {type: boolean, default: true}
+        bsnCloudEnabled: {type: boolean, default: true}
+        timeBetweenNetConnects: {type: integer, default: 300}
+        timeBetweenHeartbeats: {type: integer}
+        sfnWebFolderUrl: {type: string}
+        sfnUserName: {type: string}
+        sfnPassword: {type: string}
+        sfnEnableBasicAuthentication: {type: boolean}
+        playbackLoggingEnabled: {type: boolean}
+        eventLoggingEnabled: {type: boolean}
+        diagnosticLoggingEnabled: {type: boolean}
+        stateLoggingEnabled: {type: boolean}
+        variableLoggingEnabled: {type: boolean}
+        uploadLogFilesAtBoot: {type: boolean}
+        uploadLogFilesAtSpecificTime: {type: boolean}
+        uploadLogFilesTime: {type: integer}
+        logHandlerUrl: {type: string}
+        enableRemoteSnapshot: {type: boolean}
+        remoteSnapshotInterval: {type: integer, default: 15}
+        remoteSnapshotMaxImages: {type: integer, default: 5}
+        remoteSnapshotJpegQualityLevel: {type: integer, default: 100}
+        remoteSnapshotScreenOrientation:
+          type: string
+          enum: [Landscape, PortraitBottomLeft, PortraitBottomRight, None]
+        remoteSnapshotHandlerUrl: {type: string}
+        inheritNetworkProperties: {type: boolean}
+        networkDiagnosticsEnabled: {type: boolean}
+        testEthernetEnabled: {type: boolean}
+        testWirelessEnabled: {type: boolean}
+        testInternetEnabled: {type: boolean}
+        useCustomSplashScreen: {type: boolean}
+        contentDownloadsRestricted: {type: boolean}
+        contentDownloadRangeStart: {type: integer}
+        contentDownloadRangeEnd: {type: integer}
+        BrightWallName: {type: string}
+        BrightWallScreenNumber: {type: string}
+        usbUpdatePassword: {type: string}
+        internalCaArtifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaArtifact'
+        uiDeviceSetupErrors:
+          type: array
+          description: UI validation state carried in the server template; normally empty.
+          items:
+            type: string
+      additionalProperties: true
+
+    LegacyNetworkFields:
+      type: object
+      description: |-
+        Flat network fields of setup schema 2.0.0 (suffix `_2` = second interface). In a
+        3.0.0 setup the `network` object is authoritative; when a 2.0.0 setup is read
+        through `/v3`, `network` is derived from these fields.
+      properties:
+        useWireless: {type: boolean}
+        ssid: {type: string}
+        passphrase: {type: string}
+        timeServer: {type: string}
+        networkConnectionPriority:
+          type: string
+          enum: [wired, wireless]
+        specifyHostname: {type: boolean}
+        hostname: {type: string}
+        useProxy: {type: boolean}
+        proxyAddress: {type: string}
+        proxyPort: {type: integer}
+        networkHosts:
+          type: array
+          items: {type: string}
+        heartbeatsRestricted: {type: boolean}
+        heartbeatsRangeStart: {type: integer}
+        heartbeatsRangeEnd: {type: integer}
+        useDHCP: {type: boolean}
+        staticIPAddress: {type: string}
+        subnetMask: {type: string}
+        gateway: {type: string}
+        dns1: {type: string}
+        dns2: {type: string}
+        dns3: {type: string}
+        useDHCP_2: {type: boolean}
+        staticIPAddress_2: {type: string}
+        subnetMask_2: {type: string}
+        gateway_2: {type: string}
+        dns1_2: {type: string}
+        dns2_2: {type: string}
+        dns3_2: {type: string}
+        contentDataTypeEnabledWired: {type: boolean}
+        textFeedsDataTypeEnabledWired: {type: boolean}
+        healthDataTypeEnabledWired: {type: boolean}
+        mediaFeedsDataTypeEnabledWired: {type: boolean}
+        logUploadsXfersEnabledWired: {type: boolean}
+        contentDataTypeEnabledWireless: {type: boolean}
+        textFeedsDataTypeEnabledWireless: {type: boolean}
+        healthDataTypeEnabledWireless: {type: boolean}
+        mediaFeedsDataTypeEnabledWireless: {type: boolean}
+        logUploadsXfersEnabledWireless: {type: boolean}
+        rateLimitModeOutsideWindow:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateOutsideWindow: {type: integer}
+        rateLimitModeInWindow:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateInWindow: {type: integer}
+        rateLimitModeInitialDownloads:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateInitialDownloads: {type: integer}
+        rateLimitModeOutsideWindow_2:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateOutsideWindow_2: {type: integer}
+        rateLimitModeInWindow_2:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateInWindow_2: {type: integer}
+        rateLimitModeInitialDownloads_2:
+          $ref: '#/components/schemas/RateLimitMode'
+        rateLimitRateInitialDownloads_2: {type: integer}
+
+    RateLimitMode:
+      type: string
+      enum: [default, unlimited, specified]
+
+    DeviceSetupV3:
+      description: Setup schema 3.0.0 as returned by the API.
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupCommon'
+        - $ref: '#/components/schemas/LegacyNetworkFields'
+        - type: object
+          properties:
+            version:
+              type: string
+              pattern: '^3\.'
+              example: 3.0.0
+            network:
+              $ref: '#/components/schemas/Network'
+
+    DeviceSetupV3Input:
+      description: |-
+        Setup schema 3.0.0 for POST. `bDeploy` is required; omitted top-level fields take
+        server defaults (including `version` "3.0.0" and a DHCP `eth0` network).
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV3'
+        - type: object
+          required: [bDeploy]
+
+    DeviceSetupV3Update:
+      description: Complete setup schema 3.0.0 for PUT. Node applies no defaults; C# merges top-level defaults.
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV3'
+        - type: object
+          required: [_id, version, bDeploy, setupType, bsnGroupName, network]
+
+    DeviceSetupV2:
+      description: Setup schema 2.0.0 as returned by the API (no `network` object).
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupCommon'
+        - $ref: '#/components/schemas/LegacyNetworkFields'
+        - type: object
+          properties:
+            version:
+              type: string
+              pattern: '^2\.'
+              example: 2.0.0
+
+    DeviceSetupV2Input:
+      description: Setup schema 2.0.0 for POST. `version` must be given (server default is 3.0.0).
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV2'
+        - type: object
+          required: [version, bDeploy]
+
+    DeviceSetupV2Update:
+      description: Complete setup schema 2.0.0 for PUT.
+      allOf:
+        - $ref: '#/components/schemas/DeviceSetupV2'
+        - type: object
+          required: [_id, version, bDeploy, setupType, bsnGroupName]
+
+security:
+  - BsnOAuth2: []
+  - BsnBearer: []
