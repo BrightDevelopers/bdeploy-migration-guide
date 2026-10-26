@@ -11,7 +11,8 @@ This repository gives you what you need to automate B-Deploy from your own syste
 - a step-by-step guide for moving an existing v1 integration;
 - OpenAPI 3.0 specifications you can browse or feed to a code generator;
 - a ready-to-run Python test client that checks your credentials and exercises the API;
-- an AI coding assistant skill that applies all of this to your code ([install it](#ai-coding-assistant-skill)).
+- an AI coding assistant skill that applies all of this to your code ([install it](#ai-coding-assistant-skill));
+- connection details for the [BrightDeveloper MCP server](#brightdeveloper-mcp-server), which lets an assistant search BrightSign's developer docs.
 
 ## Where to start
 
@@ -23,6 +24,7 @@ This repository gives you what you need to automate B-Deploy from your own syste
 | See a working client to copy from | [`src/`](src/README.md): Python, standard library only |
 | Generate client code or browse the API | [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) and [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) |
 | Have an AI coding assistant port or review your client code | [AI coding assistant skill](#ai-coding-assistant-skill) |
+| Let your AI assistant search BrightSign's developer docs | [BrightDeveloper MCP server](#brightdeveloper-mcp-server) |
 
 ## AI coding assistant skill
 
@@ -45,6 +47,51 @@ ask in plain words, such as *"migrate our B-Deploy client to the v2/v3 API"*, or
 `/migrating-bdeploy-v1-to-v2`.
 
 To update the skill, copy the folder again over the old one.
+
+## BrightDeveloper MCP server
+
+BrightSign runs a Model Context Protocol (MCP) server that lets an AI assistant search
+BrightSign's developer documentation while it works. Topics include BrightScript, HTML5
+player apps, BrightSignOS, the BSN.cloud APIs and the `gopurple` Go SDK. Use it together
+with the skill above. The skill carries the B-Deploy rules, and the MCP server answers
+the wider BrightSign questions that come up around them.
+
+| Setting | Value |
+|---|---|
+| URL | `https://brightdeveloper-mcp.bsn.cloud/mcp` |
+| Transport | Streamable HTTP |
+| Authentication | None |
+| Tools | `search_docs` (semantic search), `list_available_documents`, `get_document_content` |
+
+**To connect, follow your agent's instructions for adding a remote (HTTP) MCP server.**
+Most agents accept a configuration entry like this:
+
+```json
+{
+  "mcpServers": {
+    "brightdeveloper": {
+      "type": "http",
+      "url": "https://brightdeveloper-mcp.bsn.cloud/mcp"
+    }
+  }
+}
+```
+
+For example, in Claude Code:
+
+```bash
+claude mcp add brightdeveloper --transport http https://brightdeveloper-mcp.bsn.cloud/mcp
+```
+
+Then start a new session and ask a BrightSign question, for example *"search the
+BrightDeveloper docs for how a player fetches its setup"*.
+
+**Where the two disagree on B-Deploy, this repository wins.** The documentation index
+includes the `gopurple` SDK's B-Deploy pages, and some of their statements about the API
+are wrong. The corrections are listed in
+[section 15 of the guide](docs/BDEPLOY-API-GUIDE.md#15-notes-on-the-gopurple-b-deploy-docs).
+For example, device reads never return `setupId`, and updates take the id in the request
+body, not in `?_id=`.
 
 ## What you need
 
