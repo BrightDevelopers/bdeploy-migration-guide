@@ -1,197 +1,268 @@
-# B-Deploy v1 → v2/v3 migration guide
+# B-Deploy API: developer guide and migration kit
 
-How to move a client of BrightSign's B-Deploy provisioning API from v1 to the current
-v2/v3 API. B-Deploy is the cloud service that tells a factory-fresh player which setup
-to apply and where to fetch its content. The guide includes OpenAPI 3.0 specs for both
-API generations.
+B-Deploy is BrightSign's cloud provisioning service. When a BrightSign player starts with
+blank storage, it asks B-Deploy what it should be. B-Deploy answers with a **setup**:
+networking, diagnostics, firmware policy, and either a BSN.cloud registration or the URL
+of your application. The player applies it, reboots, and runs.
 
-## Contents
+This repository gives you what you need to automate B-Deploy from your own systems:
 
-| File | Purpose |
+- a practical guide to the current API (device API v2, setup API v3);
+- a step-by-step guide for moving an existing v1 integration;
+- OpenAPI 3.0 specifications you can browse or feed to a code generator;
+- a ready-to-run Python test client that checks your credentials and exercises the API;
+- a Claude Code skill that applies all of this to your code ([install it](#claude-code-skill)).
+
+## Where to start
+
+| You want to… | Read or run |
 |---|---|
-| [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) | **Start here** if you have a v1 client. How to port it: auth, paths, behaviour changes, and a field-by-field setup mapping. |
-| [`docs/BDEPLOY-API-GUIDE.md`](docs/BDEPLOY-API-GUIDE.md) | **Start here** for new work. Guide to the current API: auth, setups, devices, setup fields, workflows, pitfalls. |
-| [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) | **Current API.** Device API v2, setup API v2 (schema 2.0.0) and v3 (schema 3.0.0). BSN.cloud OAuth2 authentication. Use this for new work. |
-| [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) | The BSN.cloud calls a B-Deploy client also needs: access token, session network, network list, registration tokens. |
-| [`swagger/v1Documentation.yaml`](swagger/v1Documentation.yaml) | Legacy v1 API: B-Deploy-local login, PascalCase setup model. Only for maintaining or migrating old clients. |
-| [`docs/IMPLEMENTATION-NOTES.md`](docs/IMPLEMENTATION-NOTES.md) | Where the specs come from, known server defects, Node vs C# differences, gopurple mismatches, security findings. |
-| [`skills/migrating-bdeploy-v1-to-v2/SKILL.md`](skills/migrating-bdeploy-v1-to-v2/SKILL.md) | Claude Code skill that applies the migration rules to client code. |
+| Check that your credentials and network work | [Verify your access](#1-verify-your-access) (about a minute) |
+| Build a new integration | [`docs/BDEPLOY-API-GUIDE.md`](docs/BDEPLOY-API-GUIDE.md) |
+| Move a v1 integration to v2/v3 | [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) |
+| See a working client to copy from | [`src/`](src/README.md): Python, standard library only |
+| Generate client code or browse the API | [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) and [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) |
+| Have Claude Code port or review your client code | [Claude Code skill](#claude-code-skill) |
 
-## How the API is laid out
+## Claude Code skill
 
-One host, `https://provision.bsn.cloud`, serves everything. The gateway routes on the
-path prefix and strips it before forwarding. v1 stays on the Node services; all v2/v3 paths go
-to the C# port (confirmed live in production on 2026-10-26).
+If you use [Claude Code](https://claude.com/claude-code), install the bundled skill. It
+gives Claude the B-Deploy wire contract and every pitfall in this repository, so it can
+port a v1 client, write a new v2/v3 client, or review existing client code in any
+language. It also reports changes your callers will notice, such as the move from a
+user name and password to API client credentials.
 
-```mermaid
-flowchart LR
-    C[API client] -->|/rest/v1/authenticate| GW[Gateway<br/>provision.bsn.cloud]
-    C -->|/rest-device/v1, v2| GW
-    C -->|/rest-setup/v1, v2, v3| GW
-    P[BrightSign player<br/>mTLS client cert] -->|/rest-device/ , /rest-setup/.../device-object/...| GW
-    GW -->|/rest/v1, /rest-device/, /rest-device/v1| PVS[PVS: devices<br/>Node]
-    GW -->|/rest-setup/v1| PSS[PSS: setups<br/>Node]
-    GW -->|/rest-device/v2, /rest-setup/v2, v3| CS[Provisioning service<br/>C# port]
+**Install it** by copying the skill folder into a skills directory:
+
+```bash
+# For one project: run from the root of the project that holds your B-Deploy client
+mkdir -p .claude/skills
+cp -r /path/to/bdeploy-migration-guide/skills/migrating-bdeploy-v1-to-v2 .claude/skills/
+
+# Or for every project on this machine
+mkdir -p ~/.claude/skills
+cp -r /path/to/bdeploy-migration-guide/skills/migrating-bdeploy-v1-to-v2 ~/.claude/skills/
 ```
 
-The resources:
+The result must be `.claude/skills/migrating-bdeploy-v1-to-v2/SKILL.md`. Commit the
+project copy if your team should share it.
 
-- **Setup**: a reusable player configuration. It covers networking, logging, DWS/LWS,
-  firmware policy, and either a BSN.cloud registration token or a partner content URL.
-  Setups are identified by `bDeploy.packageName`, which is unique per network.
-- **Device**: a player serial number registered in a network and linked to a setup
-  (`setupId`) or directly to a partner content URL (`url`).
+**Use it** by starting a new Claude Code session in your project. Then either:
 
-How a registered player gets provisioned:
+- ask in plain words, for example *"migrate our B-Deploy client to the v2/v3 API"* or
+  *"review this B-Deploy code against the current API"*, and Claude loads the skill when
+  the task matches; or
+- type `/migrating-bdeploy-v1-to-v2` to load it explicitly.
+
+To update the skill, copy the folder again over the old one.
+
+## What you need
+
+| Item | Where it comes from |
+|---|---|
+| **API client id and secret** | Create an API client in BSN.cloud. B-Deploy acts as the client's owner, so the owning account must be a user in the network you will provision into. |
+| **Network name** | Exactly as BSN.cloud shows it; case and spaces matter. |
+| **Account e-mail** | The BSN.cloud user name. Needed to create setups and register players. |
+| **Registration-token scope** (optional) | `bsn.api.main.devices.setups.token.create` on the API client. Needed only for setups whose players join BSN.cloud. |
+
+Every example in this repository reads these from the same environment variables:
+
+```bash
+export BS_CLIENT_ID='<API client id>'
+export BS_SECRET='<API client secret>'
+export BS_NETWORK='<network name>'
+export BS_USERNAME='<account e-mail>'
+```
+
+Optional variables:
+
+| Variable | Default | Used for |
+|---|---|---|
+| `BS_TEST_SERIAL` | random `ZZ` + 10 hex characters | Serial the test client's lifecycle run registers and removes |
+| `BS_TEST_URL` | `https://example.com/bdeploy-test-client/autorun.zip` | Application URL in the lifecycle run's temporary setup |
+| `BS_AUTH_URL`, `BS_API_URL`, `BS_PROVISION_URL` | `https://auth.bsn.cloud`, `https://api.bsn.cloud`, `https://provision.bsn.cloud` | Pointing the test client at a non-production environment |
+
+Keep the secret out of source control. Put these lines in an untracked `.env` or `.envrc`
+(both are already in this repository's `.gitignore`).
+
+## 1. Verify your access
+
+Run the test client's read-only check before writing any code. It changes nothing. It
+gets a token, selects your network, reads the selection back, and lists your setups and
+players:
+
+```bash
+make -C src live-check
+```
+
+```text
+PASS  get access token -- scopes: ...
+PASS  select session network -- 'mynetwork' selected (204)
+PASS  read session network back -- id=32776 name='mynetwork'
+PASS  list setups -- 5 setup(s) on first page; server='Kestrel' (C#)
+PASS  list devices -- 5 device(s) on first page
+```
+
+You need Python 3.10 or later and `make`; there is nothing to install. If a step fails,
+look the message up in the guide's [Troubleshooting](docs/BDEPLOY-API-GUIDE.md#13-troubleshooting)
+table. The same check as plain `curl` commands is in
+[Prerequisites and live check](docs/BDEPLOY-API-GUIDE.md#4-prerequisites-and-live-check).
+
+To exercise the write API end to end, run `make -C src lifecycle`. It creates a temporary
+setup and player record, reads, updates and verifies them, then deletes them again. See
+[`src/README.md`](src/README.md) for what it touches and how it cleans up.
+
+## 2. Provision a player in four calls
+
+These commands use `curl` and `jq`.
+
+**Get an access token.** Tokens last about 5.5 minutes and cannot be refreshed; request a
+new one when it expires.
+
+```bash
+TOKEN=$(curl -s https://auth.bsn.cloud/realms/bsncloud/protocol/openid-connect/token \
+  -u "$BS_CLIENT_ID:$BS_SECRET" -d grant_type=client_credentials | jq -r .access_token)
+```
+
+**Select your network.** B-Deploy takes the network from your token's session, not from
+the request. Expect HTTP `204`. Repeat this after every new token.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  https://api.bsn.cloud/2022/06/REST/Self/Session/Network \
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' -d "{\"name\":\"$BS_NETWORK\"}"
+```
+
+**Create a setup.** This one points players at your application. It returns
+`{"error":null,"result":"<setupId>"}`.
+
+```bash
+SETUP_ID=$(curl -s -X POST https://provision.bsn.cloud/rest-setup/v3/setup \
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' -d @- <<EOF | jq -r .result
+{
+  "version": "3.0.0",
+  "setupType": "partnerApplication",
+  "bDeploy": {
+    "username": "$BS_USERNAME",
+    "networkName": "$BS_NETWORK",
+    "packageName": "Lobby setup",
+    "url": "https://cms.example.com/bdeploy/autorun.zip"
+  },
+  "bsnGroupName": "Default",
+  "lwsEnabled": false,
+  "remoteDwsEnabled": false
+}
+EOF
+)
+```
+
+**Register a player** by serial number (12 characters, upper case). It returns
+`{"error":null,"result":"<deviceId>"}`.
+
+```bash
+curl -s -X POST https://provision.bsn.cloud/rest-device/v2/device \
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' -d @- <<EOF
+{"serial": "UTD416000978", "username": "$BS_USERNAME", "NetworkName": "$BS_NETWORK",
+ "name": "Lobby", "setupId": "$SETUP_ID"}
+EOF
+```
+
+Power the player on with blank storage and it provisions itself:
 
 ```mermaid
 sequenceDiagram
     participant P as Player (blank storage)
-    participant D as /rest-device
-    participant S as /rest-setup
-    participant F as Partner file server
-    P->>D: GET /rest-device/ (DeviceID header)
-    D-->>P: 301 /rest-device/v2
-    P->>D: GET /rest-device/v2
-    D-->>P: 301 (Node) or 302 (C#) /rest-setup/v2/setup-script/device-object/...
-    P->>S: GET setup-script
-    S-->>P: BrightScript (setup package URL, optional firmware)
-    P->>S: GET setup-package/device-object/...
-    S-->>P: setup ZIP
-    Note over P: reboots and applies the setup
-    P->>S: GET runtime-script/device-object/... (recovery URL)
-    S-->>P: BrightScript
-    P->>F: GET autorun.zip (device or setup url)
+    participant B as B-Deploy
+    participant F as Your file server
+    P->>B: Who am I? (serial number)
+    B-->>P: Setup script for the linked setup
+    P->>B: Download setup package
+    Note over P: Applies the setup and reboots
+    P->>F: GET autorun.zip (device or setup URL)
 ```
 
-The player-side endpoints are in the specs under the **Player protocol** tag. API clients
-cannot call them, because they require the player's client certificate.
+## Key concepts
 
-## Quick start (v2/v3)
-
-0. **Run the live check first.** The guide's
-   [Prerequisites and live check](docs/BDEPLOY-API-GUIDE.md#4-prerequisites-and-live-check)
-   section has four read-only commands that confirm your credentials, network and
-   environment in about a minute. If one fails, look the error up in
-   [Troubleshooting](docs/BDEPLOY-API-GUIDE.md#13-troubleshooting).
-
-1. **Get a token.** Use BSN.cloud OAuth2 client credentials:
-
-   ```bash
-   TOKEN=$(curl -s https://auth.bsn.cloud/realms/bsncloud/protocol/openid-connect/token \
-     -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials | jq -r .access_token)
-   ```
-
-2. **Select the network.** B-Deploy takes the network from the token's session, not
-   from the request. Expect `204`; the `Accept` header is required (without it the API
-   answers `300` and does nothing):
-
-   ```bash
-   curl -s -X PUT https://api.bsn.cloud/2022/06/REST/Self/Session/Network \
-     -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' -H 'Content-Type: application/json' \
-     -d '{"name":"mynetwork"}'
-   ```
-
-3. **Create a setup.** It returns `{"error":null,"result":"<setupId>"}`:
-
-   ```bash
-   curl -s -X POST https://provision.bsn.cloud/rest-setup/v3/setup \
-     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{
-       "version": "3.0.0",
-       "setupType": "partnerApplication",
-       "bDeploy": {
-         "username": "user@example.com",
-         "networkName": "mynetwork",
-         "packageName": "Lobby setup",
-         "url": "https://cms.example.com/bdeploy/autorun.zip"
-       },
-       "bsnGroupName": "Default"
-     }'
-   ```
-
-4. **Register a player.** It returns `{"error":null,"result":"<deviceId>"}`:
-
-   ```bash
-   curl -s -X POST https://provision.bsn.cloud/rest-device/v2/device \
-     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{"serial":"UTD416000978","username":"user@example.com",
-          "NetworkName":"mynetwork","name":"Lobby","setupId":"<setupId>"}'
-   ```
-
-## Things that surprise people
-
-Read these before writing a client. The specs and `IMPLEMENTATION-NOTES.md` have the
-detail; error symptoms are in the guide's
-[Troubleshooting](docs/BDEPLOY-API-GUIDE.md#13-troubleshooting) section.
-
-- **Headers.** Send `Accept: application/json` and your own `User-Agent` on every call.
-  Without `Accept` the Main API returns `300` and does nothing; Cloudflare blocks some
-  default library agents. Treat anything outside 2xx as a failure.
-- **Short tokens.** Access tokens last about 5.5 minutes, with no refresh token. Select
-  the network again after every new token.
-
-- **Response envelope.** Every JSON response is `{"error": ..., "result": ...}`, and
-  creates return 201.
-- **Two shapes for setup GETs.**
-  - A list returns stored records, with the setup as a JSON *string* in `setupJson`.
-  - Get-by-id (`/setup/{id}`) returns a *one-element array* of the parsed setup.
-    Don't use `?_id=`: the C# service ignores it and returns the list.
-- **`setupId` is never returned by device GETs.** Use `setupName`.
-- **Send complete records on PUT.**
-  - Device PUT on Node replaces the record, so a partial body deletes fields.
-  - Setup PUT on Node applies no defaults, so omitted fields are lost.
-  - Setup PUT returns an update result, not the setup.
-- **No path ids on writes.** Ids go in the body (`PUT`) or in `?_id=` (`DELETE`).
-  There is no `PUT .../{id}`.
-- **Filters.** Setup lists filter with `query[packageName]=`; a flat `packageName=` is
-  ignored. A device GET with no filter returns an empty list; always pass `NetworkName`.
-- **Two server implementations differ** on page-size defaults, id format (24-hex vs
-  decimal) and several error codes. Treat ids as opaque, send `pageSize`, and branch on
-  status class and the `error` field.
-
-## Viewing the specs
-
-- **Online:** paste or upload a YAML file at <https://editor.swagger.io/>.
-- **Locally:** run
-  `npx @redocly/cli@1.34.3 preview-docs swagger/bdeploy-v2-v3.yaml`
-  (long-running; stop with Ctrl-C).
-- **Client code:** both files are self-contained and work with OpenAPI 3.0 code
-  generators. The `oneOf` result types and the `JsonNull` schema are deliberate: they
-  describe responses whose shape depends on the request.
-
-## Validating and building
-
-Lint the specs with Redocly (requires Node.js for `npx`), from the repository root:
-
-```bash
-npx @redocly/cli@1.34.3 lint --extends recommended \
-  --skip-rule no-path-trailing-slash --skip-rule info-license \
-  swagger/bdeploy-v2-v3.yaml swagger/bsn-main-provisioning.yaml swagger/v1Documentation.yaml
+```mermaid
+flowchart LR
+    D1[Device<br/>serial UTD416000978] -->|setupId| S[Setup<br/>packageName Lobby]
+    D2[Device<br/>serial XTC2000123AB] -->|setupId| S
+    D3[Device<br/>serial XD4000555CD] -->|url| U[Your application URL]
+    S -->|setupType bsn| T[Joins BSN.cloud]
+    S -->|setupType partnerApplication| A[Runs your application]
 ```
 
-Two rules are turned off on purpose:
+- **Setup:** a reusable player configuration, named by `bDeploy.packageName`. One
+  setup serves any number of players.
+- **Device:** one player serial number, registered in one network. It is linked to a
+  setup (`setupId`) or points straight at an application (`url`). A serial can be
+  registered in only one network at a time.
+- **Setup type** decides what the player does after provisioning:
 
-- `no-path-trailing-slash`: the player entry point really is `/rest-device/`.
-- `info-license`: the APIs are proprietary, so there is no license to declare.
+  | `setupType` | The player… |
+  |---|---|
+  | `partnerApplication` | downloads and runs your application from `bDeploy.url` |
+  | `bsn` | joins BSN.cloud and is managed from there (needs a registration token) |
+  | `sfn` | pulls content from a web folder (Simple File Networking) |
+  | `lfn` | receives content over the local network (Local File Networking) |
+  | `standalone` | runs local content |
 
-The one remaining warning is on `DELETE /rest-device/v1/device/ids/{idarray}`, which is
-documented as broken and has no success response.
+- **Hosts:** tokens come from `auth.bsn.cloud`, network selection and registration
+  tokens from `api.bsn.cloud`, and all B-Deploy calls go to `provision.bsn.cloud`.
 
-## Migrating v1 clients
+## Things that catch people out
 
-Read [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md). To have Claude Code
-apply the same rules to client code, copy `skills/migrating-bdeploy-v1-to-v2/` into the
-client project's `.claude/skills/` (or `~/.claude/skills/` for all projects).
+Read these before writing a client. The guide has the details, and its
+[pitfalls checklist](docs/BDEPLOY-API-GUIDE.md#14-pitfalls-checklist) is a good code-review
+list.
 
-## Keeping the specs accurate
+- **Send `Accept: application/json` and your own `User-Agent` on every call.** Without
+  `Accept`, the network-selection call answers `300` and silently does nothing. Some
+  default library agents, including Python's `Python-urllib`, are blocked with
+  `403 error code: 1010`.
+- **Check the `error` field, not only the status.** Every response is
+  `{"error": ..., "result": ...}`, and some errors arrive with HTTP 200. Treat any
+  non-2xx, including 3xx, as a failure.
+- **Select the network after every new token.** Without it, B-Deploy calls fail, often
+  with an empty `403`.
+- **Defaults switch features on.** A new setup gets the Local Web Server, remote
+  diagnostics and BSN.cloud turned on unless you send `false`.
+- **Setups come back in two shapes.** A list returns records holding the setup as a JSON
+  *string* in `setupJson`. `GET /setup/{id}` returns a *one-element array*.
+- **Device reads never include `setupId`.** Use `setupName`. Put `setupId` back before
+  every device update, or the player loses its link.
+- **Always send complete records on PUT.** A partial body can erase the fields you left
+  out. Read, modify, then write the whole record.
+- **Filter setups with `query[packageName]=`.** A plain `?packageName=` is ignored and
+  returns everything. Name filters can match partially, so compare names exactly in your
+  code, and expect duplicates in older data.
+- **Always pass `NetworkName` and `pageSize`.** A device list with no filter is empty,
+  and page sizes default differently between environments.
+- **Upper-case serial numbers.** Matching is case-sensitive.
+- **Account names containing `brightsign`, `bsn` or `bacon`** need a registration
+  token on every setup, whatever the setup type.
 
-The server code is the source of truth. When PVS, PSS or the C# provisioning service
-changes:
+## Repository contents
 
-1. Update the affected operation in the spec.
-2. Update the Node vs C# table in `docs/IMPLEMENTATION-NOTES.md` if the two diverge further.
-3. Update `docs/MIGRATION-v1-to-v2.md` and the skill if client-visible behaviour changed.
-4. Run the lint command above.
+| Path | Contents |
+|---|---|
+| [`docs/BDEPLOY-API-GUIDE.md`](docs/BDEPLOY-API-GUIDE.md) | The current API: authentication, every call, the setup field reference, workflows, troubleshooting |
+| [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) | Porting a v1 client: authentication, paths, behaviour changes, field-by-field setup mapping |
+| [`docs/IMPLEMENTATION-NOTES.md`](docs/IMPLEMENTATION-NOTES.md) | Background on how the specs were produced and how server behaviour varies |
+| [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) | OpenAPI 3.0: device API v2, setup API v2 and v3 |
+| [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) | OpenAPI 3.0: access token, network selection, network list, registration tokens |
+| [`swagger/v1Documentation.yaml`](swagger/v1Documentation.yaml) | OpenAPI 3.0: the legacy v1 API, for maintaining or migrating old clients |
+| [`src/`](src/README.md) | Python test client: live check, end-to-end lifecycle test, reusable client class |
+| [`skills/migrating-bdeploy-v1-to-v2/`](skills/migrating-bdeploy-v1-to-v2/SKILL.md) | Claude Code skill for migrating and reviewing B-Deploy client code |
 
-Note the source revision you checked against in the commit message.
+## Browsing the specs and generating code
+
+- **In a browser:** open <https://editor.swagger.io/> and paste or upload a YAML file.
+- **Locally:** `npx @redocly/cli@1.34.3 preview-docs swagger/bdeploy-v2-v3.yaml`
+  (stop with Ctrl-C).
+- **Code generators:** each spec is self-contained OpenAPI 3.0. The `oneOf` result types
+  and the `JsonNull` schema are deliberate: some responses change shape depending on the
+  request.

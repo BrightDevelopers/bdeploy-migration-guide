@@ -235,3 +235,40 @@ credentials, then the session-network PUT) matches the wire contract.
   check before the network check, so the response reveals whether another network's
   setup is in use. On Node the check calls PVS `GET /v2/count-setups/:setupId`, which is
   not network-scoped.
+
+## Maintaining this repository
+
+### Validating the specs
+
+Lint with Redocly (requires Node.js for `npx`), from the repository root:
+
+```bash
+npx @redocly/cli@1.34.3 lint --extends recommended \
+  --skip-rule no-path-trailing-slash --skip-rule info-license \
+  swagger/bdeploy-v2-v3.yaml swagger/bsn-main-provisioning.yaml swagger/v1Documentation.yaml
+```
+
+Two rules are turned off on purpose:
+
+- `no-path-trailing-slash`: the player entry point really is `/rest-device/`.
+- `info-license`: the APIs are proprietary, so there is no license to declare.
+
+The one remaining warning is on `DELETE /rest-device/v1/device/ids/{idarray}`, which is
+documented as broken and has no success response.
+
+The Python test client has its own offline suite: `make -C src run-tests`.
+
+### Keeping the specs accurate
+
+The server code is the source of truth. When PVS, PSS or the C# provisioning service
+changes:
+
+1. Update the affected operation in the spec.
+2. Update the Node vs C# table above if the two diverge further.
+3. Update `docs/MIGRATION-v1-to-v2.md`, `docs/BDEPLOY-API-GUIDE.md` and the skill if
+   client-visible behaviour changed.
+4. Update the fake server in `src/tests/fake_bsn.py` if the C# behaviour it models
+   changed, and run `make -C src run-tests`.
+5. Run the lint command above.
+
+Note the source revision you checked against in the commit message.

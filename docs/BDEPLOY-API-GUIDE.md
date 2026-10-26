@@ -121,11 +121,11 @@ sequenceDiagram
 
 ```bash
 TOKEN=$(curl -s https://auth.bsn.cloud/realms/bsncloud/protocol/openid-connect/token \
-  -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials | jq -r .access_token)
+  -u "$BS_CLIENT_ID:$BS_SECRET" -d grant_type=client_credentials | jq -r .access_token)
 
 curl -s -X PUT https://api.bsn.cloud/2022/06/REST/Self/Session/Network \
   -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' -H 'Content-Type: application/json' \
-  -d '{"name":"mynetwork"}'
+  -d "{\"name\":\"$BS_NETWORK\"}"
 ```
 
 Rules:
@@ -631,7 +631,7 @@ Main API, using the same access token and session network:
 
 ```bash
 curl -s -X POST https://api.bsn.cloud/2022/06/REST/Provisioning/Setups/Tokens/ \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json'
 ```
 
 ```json
