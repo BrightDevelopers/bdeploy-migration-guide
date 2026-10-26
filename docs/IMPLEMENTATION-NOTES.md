@@ -7,6 +7,12 @@ between the two server implementations, and mismatches in the `gopurple` SDK.
 
 ## Sources
 
+The specs were written by reading the server source, not by observing live traffic, and
+have not been validated against a running server. Last verified on 2026-10-26 against
+`provisioning-server` `a7811d7`, `bsn-cloud-inherited` `develop` `12324a084` and
+`gopurple` `4bc27aa`. C# framework behaviours (empty 401/403 bodies,
+`application/problem+json` errors, 406 on failed package downloads) are inferred.
+
 | Source | Location | Used for |
 |---|---|---|
 | PVS (device service, Node) | `bsn-core/provisioning-server/server/` (`api-utils-v1.js`, `api-utils-v2.js`, `service.js`, `db-utils.js`, `app-middleware.js`, `device-schema.js`) | `/rest`, `/rest-device` |
@@ -37,9 +43,9 @@ environment, production included. With Gateway API longest-prefix matching, that
 - **Bare `/rest-device/`, `/rest/v1/*`, `/rest-device/v1/*` and `/rest-setup/v1/*` stay
   on Node.**
 
-The production deploy is a manual step (`deploy-production` input of
-`.github/workflows/k8sBuildAndDeploy.yml`), so the repositories cannot show whether
-production is already cut over. Local-dev routing (`envoy.yaml`, paths prefixed with
+**Production is cut over.** On 2026-10-26, `GET /rest-setup/v3/setup` and
+`GET /rest-device/v2/device` on `provision.bsn.cloud` answered with `server: Kestrel`
+(ASP.NET), i.e. the C# service. Local-dev routing (`envoy.yaml`, paths prefixed with
 `/provision/`) has the same split.
 
 The specs were written with Node as the reference and call out C# differences where they
@@ -50,6 +56,26 @@ Hostnames: production is `provision.bsn.cloud` and also `provision.brightsignnet
 staging, QA and dev are `provision.bsn-staging.net`, `provision.bsn-qa.net` and
 `provision.bsn-dev.net`. Disaster-recovery hosts `provision.bsn.repair` and
 `provision.bsn-dr-staging.repair` also exist.
+
+## Observed on the live service (2026-10-26)
+
+Found while running a read-only live check (token, session network, setup and device
+lists) against production:
+
+- **v2/v3 is served by the C# port** (`server: Kestrel`). The C# column of the table
+  below is the behaviour production clients get.
+- **Main API needs an `Accept` header.** Without one, `api.bsn.cloud` returns
+  `300 Multiple Choices` with an empty body (`AcceptlessRequestFilter`) and does nothing.
+  A `PUT Self/Session/Network` without `Accept` therefore leaves the session with no
+  network, and every B-Deploy call then fails with an empty-body 403.
+- **C# authorization is by principal type.** Setup routes need a "User" principal
+  (identity name `network/login`, built from the session network). A token whose session
+  has no network is a "Person" and gets an empty-body 403 on setup and device lists.
+- **Cloudflare blocks the `Python-urllib` User-Agent** on `auth.bsn.cloud` and
+  `api.bsn.cloud` (403, `error code: 1010`). `provision.bsn.cloud` does not.
+- **`packageName` is not unique in practice.** The test network holds two setups named
+  `preflight-20260410-032116`, so look-ups by name must handle duplicates.
+- Existing records have 24-hex ObjectIds (migrated from Node).
 
 ## Corrections to the previous specs
 

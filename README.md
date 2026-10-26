@@ -9,42 +9,19 @@ API generations.
 
 | File | Purpose |
 |---|---|
-| [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) | **Start here.** How to port a v1 client: auth, paths, behaviour changes, and a field-by-field setup mapping. |
+| [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) | **Start here** if you have a v1 client. How to port it: auth, paths, behaviour changes, and a field-by-field setup mapping. |
+| [`docs/BDEPLOY-API-GUIDE.md`](docs/BDEPLOY-API-GUIDE.md) | **Start here** for new work. Guide to the current API: auth, setups, devices, setup fields, workflows, pitfalls. |
 | [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) | **Current API.** Device API v2, setup API v2 (schema 2.0.0) and v3 (schema 3.0.0). BSN.cloud OAuth2 authentication. Use this for new work. |
+| [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) | The BSN.cloud calls a B-Deploy client also needs: access token, session network, network list, registration tokens. |
 | [`swagger/v1Documentation.yaml`](swagger/v1Documentation.yaml) | Legacy v1 API: B-Deploy-local login, PascalCase setup model. Only for maintaining or migrating old clients. |
 | [`docs/IMPLEMENTATION-NOTES.md`](docs/IMPLEMENTATION-NOTES.md) | Where the specs come from, known server defects, Node vs C# differences, gopurple mismatches, security findings. |
 | [`skills/migrating-bdeploy-v1-to-v2/SKILL.md`](skills/migrating-bdeploy-v1-to-v2/SKILL.md) | Claude Code skill that applies the migration rules to client code. |
 
-## Status and trust level
-
-The specs were written in October 2026 by reading the server source, not by
-generating them or by observing live traffic:
-
-- **Node services** (`bsn-core/provisioning-server`): PVS (devices) and PSS (setups).
-  The specs use these as the reference behaviour.
-- **C# port** (`bsn-cloud-inherited`, `develop`, `BSN.Cloud.Hosts.API.Provisioning`).
-  Where it differs in ways a client would notice, the spec says so.
-- **`gopurple` SDK**, used as a cross-check.
-
-They have **not** been validated against a running server. These parts are inferred
-rather than observed:
-
-- Whether production already runs the C# port for v2/v3. Its gateway route on
-  `develop` claims all v2/v3 paths in every environment, but the production deploy is a
-  manual step.
-- A few C# framework behaviours: empty 401/403 bodies, `application/problem+json`
-  errors, and 406 on failed package downloads.
-
-[`docs/IMPLEMENTATION-NOTES.md`](docs/IMPLEMENTATION-NOTES.md) lists every source file used.
-
-Last verified on 2026-10-26 against `provisioning-server` `a7811d7`,
-`bsn-cloud-inherited` `develop` `12324a084` and `gopurple` `4bc27aa`.
-
 ## How the API is laid out
 
 One host, `https://provision.bsn.cloud`, serves everything. The gateway routes on the
-path prefix and strips it before forwarding. v1 stays on the Node services; the C# port's
-route (on `develop`) takes all v2/v3 paths.
+path prefix and strips it before forwarding. v1 stays on the Node services; all v2/v3 paths go
+to the C# port (confirmed live in production on 2026-10-26).
 
 ```mermaid
 flowchart LR
@@ -92,6 +69,12 @@ cannot call them, because they require the player's client certificate.
 
 ## Quick start (v2/v3)
 
+0. **Run the live check first.** The guide's
+   [Prerequisites and live check](docs/BDEPLOY-API-GUIDE.md#4-prerequisites-and-live-check)
+   section has four read-only commands that confirm your credentials, network and
+   environment in about a minute. If one fails, look the error up in
+   [Troubleshooting](docs/BDEPLOY-API-GUIDE.md#13-troubleshooting).
+
 1. **Get a token.** Use BSN.cloud OAuth2 client credentials:
 
    ```bash
@@ -100,11 +83,12 @@ cannot call them, because they require the player's client certificate.
    ```
 
 2. **Select the network.** B-Deploy takes the network from the token's session, not
-   from the request:
+   from the request. Expect `204`; the `Accept` header is required (without it the API
+   answers `300` and does nothing):
 
    ```bash
    curl -s -X PUT https://api.bsn.cloud/2022/06/REST/Self/Session/Network \
-     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' -H 'Content-Type: application/json' \
      -d '{"name":"mynetwork"}'
    ```
 
@@ -138,7 +122,14 @@ cannot call them, because they require the player's client certificate.
 ## Things that surprise people
 
 Read these before writing a client. The specs and `IMPLEMENTATION-NOTES.md` have the
-detail.
+detail; error symptoms are in the guide's
+[Troubleshooting](docs/BDEPLOY-API-GUIDE.md#13-troubleshooting) section.
+
+- **Headers.** Send `Accept: application/json` and your own `User-Agent` on every call.
+  Without `Accept` the Main API returns `300` and does nothing; Cloudflare blocks some
+  default library agents. Treat anything outside 2xx as a failure.
+- **Short tokens.** Access tokens last about 5.5 minutes, with no refresh token. Select
+  the network again after every new token.
 
 - **Response envelope.** Every JSON response is `{"error": ..., "result": ...}`, and
   creates return 201.
@@ -171,12 +162,12 @@ detail.
 
 ## Validating and building
 
-Lint both specs with Redocly (requires Node.js for `npx`), from the repository root:
+Lint the specs with Redocly (requires Node.js for `npx`), from the repository root:
 
 ```bash
 npx @redocly/cli@1.34.3 lint --extends recommended \
   --skip-rule no-path-trailing-slash --skip-rule info-license \
-  swagger/bdeploy-v2-v3.yaml swagger/v1Documentation.yaml
+  swagger/bdeploy-v2-v3.yaml swagger/bsn-main-provisioning.yaml swagger/v1Documentation.yaml
 ```
 
 Two rules are turned off on purpose:

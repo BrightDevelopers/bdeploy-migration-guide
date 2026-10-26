@@ -53,10 +53,13 @@ Every response is `{"error": string|null, "result": ...}`; 201 on create.
    `gateway`, `dns` for the player to come up; the servers don't validate this, so a bad
    setup is only caught on the player. If the v1 data lacks them, keep `DHCPv4` and flag it.
 5. **Setup field mapping:** use the table in `docs/MIGRATION-v1-to-v2.md` §3.
-6. **Portability (two server implementations):** treat ids as opaque strings; always send
+6. **Headers:** send `Accept: application/json` and an explicit User-Agent on every call.
+   Without `Accept` the Main API returns 300 and silently skips the session-network PUT.
+   Treat 3xx as failure.
+7. **Portability (two server implementations):** treat ids as opaque strings; always send
    `pageSize` and the network; `Content-Type: application/json` exactly; branch on status
    class + `error`, and tolerate empty or `application/problem+json` error bodies.
-7. **Auth semantics change:** v1 user/password become OAuth client id/secret. Surface
+8. **Auth semantics change:** v1 user/password become OAuth client id/secret. Surface
    this to the user as a breaking change for callers.
 
 ## Common mistakes

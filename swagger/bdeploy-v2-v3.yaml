@@ -40,9 +40,8 @@ info:
 
     ## Two implementations
     These routes are served by the original Node services (PVS/PSS) or by their C# port
-    (`BSN.Cloud.Hosts.API.Provisioning`). The C# gateway route on `develop` sends all
-    v2/v3 paths to C# in every environment; whether production has been deployed with it
-    cannot be confirmed from source. The success
+    (`BSN.Cloud.Hosts.API.Provisioning`). Production v2/v3 is served by the C# port
+    (observed 2026-10-26); other environments may still route to Node. The success
     shapes in this document are common to both. Portable clients should:
 
     * branch on HTTP status class and the `error` field, not on exact 4xx codes — the

@@ -1,0 +1,378 @@
+openapi: 3.0.3
+info:
+  title: BSN.cloud calls used by B-Deploy clients
+  version: 1.0.0
+  description: |-
+    The BSN.cloud calls a B-Deploy client needs besides B-Deploy itself: getting an access
+    token, selecting the session network, listing networks, and managing device
+    registration tokens for `bsn` setups. B-Deploy is in `bdeploy-v2-v3.yaml`.
+
+    This is a deliberately small subset. The full Main API and auth descriptions are in
+    the `BrightDevelopers/bsn-cloud-openapi` repository (`specs/main-2022-06.yaml`,
+    `specs/auth.yaml`).
+
+    ## Sequence
+    1. `POST /realms/bsncloud/protocol/openid-connect/token` on `auth.bsn.cloud`.
+    2. `PUT /2022/06/REST/Self/Session/Network` with `{"name": "<network>"}`; expect 204.
+    3. Optionally `GET /2022/06/REST/Self/Session/Network` to confirm the selection.
+    4. Call B-Deploy (`provision.bsn.cloud`) and the network-scoped calls below.
+    Repeat 1 and 2 for every new token.
+
+    ## Required on every request
+    * **`Accept: application/json`.** A global filter (`AcceptlessRequestFilter`, added in
+      `BSN.WebServices/Initialization/ControllersInitializer.cs`) answers any request
+      without an `Accept` header with **300 Multiple Choices**, an empty body and a `Link`
+      header listing the available media types. The action does **not** run: a
+      session-network PUT without `Accept` leaves the session without a network. The
+      response is not XML by default; XML is returned only when asked for.
+    * **Your own `User-Agent`.** Cloudflare in front of `auth.bsn.cloud` and
+      `api.bsn.cloud` blocks some default library agents with 403 and the plain-text body
+      `error code: 1010` (observed for Python's `Python-urllib`).
+    * Treat every status outside 2xx as a failure, 3xx included.
+
+    ## Tokens and sessions
+    Client-credentials access tokens last about 5.5 minutes (`expires_in` 330) and come
+    with no refresh token: request a new one before expiry. The selected network is held
+    server-side against the token's session, so each new token starts with no network.
+    Sessions end after 24 hours (410 Gone).
+
+    ## Provenance
+    Server source: `bsn-cloud-inherited` branch `develop`
+    (`WebHosts/BSN.WebServices/Self/v202206/REST/SelfSessionsController.cs`,
+    `SelfController.cs`, `Main/v202206/REST/ProvisioningController.cs`).
+    Operations marked `x-verified-live` were exercised against production on that date.
+  contact:
+    name: BrightSign
+    url: https://www.brightsign.biz
+servers:
+  - url: https://api.bsn.cloud
+    description: BSN.cloud Main API (production)
+tags:
+  - name: Authentication
+    description: OAuth2 client-credentials token from `auth.bsn.cloud`.
+  - name: Session
+    description: Selecting and confirming the network B-Deploy calls act on.
+  - name: Registration tokens
+    description: Device registration tokens for `bsn` setups.
+security:
+  - BsnBearer: []
+paths:
+  /realms/bsncloud/protocol/openid-connect/token:
+    servers:
+      - url: https://auth.bsn.cloud
+        description: Keycloak (production)
+    post:
+      tags: [Authentication]
+      operationId: getAccessToken
+      summary: Get an access token (OAuth2 client credentials)
+      description: |-
+        Send the API client's id and secret as HTTP Basic credentials. Returns a bearer
+        token for `api.bsn.cloud` and `provision.bsn.cloud`. There is no refresh token;
+        request a new token before `expires_in` runs out.
+      x-verified-live: '2026-10-26'
+      security:
+        - ClientBasic: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [client_credentials]
+      responses:
+        '200':
+          description: Access token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessToken'
+        '401':
+          description: |-
+            Unknown client or wrong secret (`invalid_client`). Also returned for
+            credentials issued in another environment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              example:
+                error: invalid_client
+                error_description: Invalid client or Invalid client credentials
+        '403':
+          $ref: '#/components/responses/CloudflareBlocked'
+
+  /2022/06/REST/Self/Session/Network:
+    get:
+      tags: [Session]
+      operationId: getSessionNetwork
+      summary: Get the network selected on this token's session
+      description: Use after selecting a network to confirm the selection took effect.
+      x-verified-live: '2026-10-26'
+      responses:
+        '200':
+          description: The selected network.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkInfo'
+              example:
+                id: 32776
+                name: mynetwork
+        '204':
+          description: No network is selected (empty body). B-Deploy calls will fail.
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareBlocked'
+        '406':
+          description: '`Accept` names only types this action cannot produce (e.g. `application/xml`).'
+        '410':
+          description: The session has expired (24-hour ceiling). Get a new token.
+    put:
+      tags: [Session]
+      operationId: setSessionNetwork
+      summary: Select the session network (required after every new token)
+      description: |-
+        Selects the network that network-scoped Main API calls and all B-Deploy v2/v3
+        calls act on. Address the network by `name` (or `id`). Send JSON `null` to clear
+        the selection.
+      x-verified-live: '2026-10-26'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NetworkInfo'
+            example:
+              name: mynetwork
+      responses:
+        '204':
+          description: Network selected (or cleared).
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '400':
+          description: |-
+            The caller is not a member of the network, the name is wrong, or the account
+            or network is locked out.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareBlocked'
+        '410':
+          description: The session has expired (24-hour ceiling). Get a new token.
+
+  /2022/06/REST/Self/Networks:
+    get:
+      tags: [Session]
+      operationId: listNetworks
+      summary: List the networks the caller belongs to
+      description: |-
+        Plain array, not paged. Use a returned `name` with `setSessionNetwork`. For an API
+        client, "the caller" is the account that owns the client.
+      x-verified-live: '2026-10-26'
+      x-required-scope: bsn.api.self.networks.retrieve
+      responses:
+        '200':
+          description: The caller's networks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Network'
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CloudflareBlocked'
+
+  /2022/06/REST/Provisioning/Setups/Tokens:
+    post:
+      tags: [Registration tokens]
+      operationId: createRegistrationToken
+      summary: Create a device registration token
+      description: |-
+        Issues a token that players provisioned with a `bsn` setup use to join the
+        selected network. No request body. Copy all four fields of the result into the
+        setup's `bsnDeviceRegistrationTokenEntity`. Requires a selected session network.
+      x-required-scope: bsn.api.main.devices.setups.token.create
+      x-requires-network-session: true
+      responses:
+        '201':
+          description: Token created.
+          headers:
+            Location:
+              description: URL of `validateRegistrationToken` for this token.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationToken'
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing scope, no session network, or blocked by Cloudflare.
+        '500':
+          description: Token generation failed.
+
+  /2022/06/REST/Provisioning/Setups/Tokens/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Registration tokens]
+      operationId: validateRegistrationToken
+      summary: Validate a device registration token
+      x-required-scope: bsn.api.main.devices.setups.token.validate
+      x-requires-network-session: true
+      responses:
+        '200':
+          description: Token details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationToken'
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing scope, no session network, or blocked by Cloudflare.
+        '404':
+          description: Unknown, revoked, or belongs to another network.
+    delete:
+      tags: [Registration tokens]
+      operationId: revokeRegistrationToken
+      summary: Revoke a device registration token
+      description: |-
+        Players that have not yet registered with this token can no longer use it. A
+        `cert`-scope token is shared by every player provisioned from the setup.
+      x-required-scope: bsn.api.main.devices.setups.token.revoke
+      x-requires-network-session: true
+      responses:
+        '204':
+          description: Token revoked.
+        '300':
+          $ref: '#/components/responses/MissingAccept'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing scope, no session network, or blocked by Cloudflare.
+        '404':
+          description: Unknown, already revoked, or belongs to another network.
+
+components:
+  securitySchemes:
+    BsnBearer:
+      type: http
+      scheme: bearer
+      description: Access token from `getAccessToken`.
+    ClientBasic:
+      type: http
+      scheme: basic
+      description: API client id and secret.
+  responses:
+    MissingAccept:
+      description: |-
+        The request had no `Accept` header. Empty body; the action did not run. The `Link`
+        header lists the available media types. Resend with `Accept: application/json`.
+      headers:
+        Link:
+          schema:
+            type: string
+          example: '<https://api.bsn.cloud/2022/06/REST/Self/Session/Network>; type="application/json"'
+    Unauthorized:
+      description: Missing, expired or invalid access token. Get a new token and select the network again.
+    CloudflareBlocked:
+      description: |-
+        Blocked at the Cloudflare edge before reaching the service, typically because of
+        the User-Agent. Body is plain text `error code: 1010`.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: 'error code: 1010'
+  schemas:
+    AccessToken:
+      type: object
+      required: [access_token, expires_in, token_type]
+      properties:
+        access_token:
+          type: string
+          description: JWT. Its `session_state` claim identifies the session that holds the selected network.
+        expires_in:
+          type: integer
+          description: Lifetime in seconds (330 observed).
+          example: 330
+        token_type:
+          type: string
+          example: Bearer
+        scope:
+          type: string
+          description: Space-separated scopes granted to the client.
+    OAuthError:
+      type: object
+      properties:
+        error:
+          type: string
+        error_description:
+          type: string
+    NetworkInfo:
+      type: object
+      nullable: true
+      description: A network reference. Address by `name` (preferred) or `id`.
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+    Network:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        displayName:
+          type: string
+          nullable: true
+        creationDate:
+          type: string
+          format: date-time
+        lastModifiedDate:
+          type: string
+          format: date-time
+        isLockedOut:
+          type: boolean
+        lockoutDate:
+          type: string
+          format: date-time
+          nullable: true
+    RegistrationToken:
+      type: object
+      required: [token, scope, validFrom, validTo]
+      description: Use as-is for a setup's `bsnDeviceRegistrationTokenEntity`.
+      properties:
+        token:
+          type: string
+        scope:
+          type: string
+          example: cert
+        validFrom:
+          type: string
+          format: date-time
+        validTo:
+          type: string
+          format: date-time
