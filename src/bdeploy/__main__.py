@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 from .client import BDeployClient, Config, ConfigurationError
@@ -27,13 +26,12 @@ def _parse_arguments(argv: list[str]) -> argparse.Namespace:
     )
     lifecycle.add_argument(
         "--serial",
-        default=os.environ.get("BS_TEST_SERIAL"),
-        help="12-character serial to register (default: BS_TEST_SERIAL, else a random ZZ-prefixed serial)",
+        help="12-character serial to register (default: a random ZZ-prefixed serial)",
     )
     lifecycle.add_argument(
         "--url",
-        default=os.environ.get("BS_TEST_URL") or DEFAULT_TEST_URL,
-        help="partner application URL for the test setup (default: BS_TEST_URL or a placeholder)",
+        default=DEFAULT_TEST_URL,
+        help="partner application URL for the test setup (default: a placeholder)",
     )
     return parser.parse_args(argv)
 

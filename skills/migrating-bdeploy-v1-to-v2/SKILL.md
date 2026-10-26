@@ -50,8 +50,7 @@ Sessions end after 24 hours: `api.bsn.cloud` then answers 410 Gone, and the fix 
 new token plus a new network selection.
 
 Configuration convention: `BS_CLIENT_ID`, `BS_SECRET`, `BS_NETWORK`, and `BS_USERNAME`
-(the account e-mail, needed for setup and device writes). Optional: `BS_AUTH_URL`,
-`BS_API_URL` and `BS_PROVISION_URL` for non-production hosts. Never hard-code the secret.
+(the account e-mail, needed for setup and device writes). Never hard-code the secret.
 When the API client id and secret are created in BSN.cloud, the client must be given
 scope for **all the Device actions**.
 

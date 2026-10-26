@@ -114,7 +114,7 @@ class Config:
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> Config:
-        """Read BS_CLIENT_ID, BS_SECRET, BS_NETWORK, BS_USERNAME and optional host overrides."""
+        """Read BS_CLIENT_ID, BS_SECRET, BS_NETWORK and BS_USERNAME; hosts are the production defaults."""
         environment = os.environ if environment is None else environment
         required = ("BS_CLIENT_ID", "BS_SECRET", "BS_NETWORK")
         missing = [name for name in required if not environment.get(name)]
@@ -125,9 +125,6 @@ class Config:
             client_secret=environment["BS_SECRET"],
             network=environment["BS_NETWORK"],
             username=environment.get("BS_USERNAME") or None,
-            auth_url=environment.get("BS_AUTH_URL") or DEFAULT_AUTH_URL,
-            api_url=environment.get("BS_API_URL") or DEFAULT_API_URL,
-            provision_url=environment.get("BS_PROVISION_URL") or DEFAULT_PROVISION_URL,
         )
 
 

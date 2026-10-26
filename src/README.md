@@ -27,13 +27,15 @@ make lifecycle             # live check, then a throwaway setup + device
 make run-tests             # offline: build + unit tests against the fake server
 ```
 
-| Variable | Required | Default |
-|---|---|---|
-| `BS_CLIENT_ID`, `BS_SECRET`, `BS_NETWORK` | yes | |
-| `BS_USERNAME` | `lifecycle` | |
-| `BS_TEST_SERIAL` | no | random `ZZ` + 10 hex characters |
-| `BS_TEST_URL` | no | `https://example.com/bdeploy-test-client/autorun.zip` |
-| `BS_AUTH_URL`, `BS_API_URL`, `BS_PROVISION_URL` | no | production hosts. Override them for staging, QA or dev, e.g. `https://provision.bsn-staging.net`. |
+| Variable | Needed for |
+|---|---|
+| `BS_CLIENT_ID`, `BS_SECRET`, `BS_NETWORK` | everything |
+| `BS_USERNAME` | `lifecycle` |
+
+The client always talks to the production hosts. For `lifecycle`, `--serial` picks the
+serial to register (default: a random `ZZ`-prefixed serial) and `--url` sets the
+temporary setup's application URL (default: a placeholder). Run
+`python -m bdeploy lifecycle --help` from `src/` for details.
 
 Exit codes: `0` all steps passed, `1` a step failed, `2` configuration error.
 

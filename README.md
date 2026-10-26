@@ -133,14 +133,6 @@ binaries land in `bin/`; for example, `./bin/bdeploy-list-setups` and
 [releases](https://github.com/BrightDevelopers/gopurple/releases) for the latest version
 before pinning.
 
-**Using GoPurple for B-Deploy:** as of commit `4bc27aa` (after `v0.2.4`), its B-Deploy
-service has gaps that this repository documents. Name filters are ignored, page size is
-never sent (so large lists come back truncated), setup lists drop `setupJson`, and
-updates send partial records. Apply the workarounds in
-[section 15 of the guide](docs/BDEPLOY-API-GUIDE.md#15-notes-on-the-gopurple-b-deploy-docs),
-or call B-Deploy directly as the guide and the [Python test client](src/README.md) do.
-The AI coding assistant skill knows these gaps too.
-
 ## What you need
 
 | Item | Where it comes from |
@@ -157,14 +149,6 @@ export BS_SECRET='<API client secret>'
 export BS_NETWORK='<network name>'
 export BS_USERNAME='<account e-mail>'
 ```
-
-Optional variables:
-
-| Variable | Default | Used for |
-|---|---|---|
-| `BS_TEST_SERIAL` | random `ZZ` + 10 hex characters | Serial the test client's lifecycle run registers and removes |
-| `BS_TEST_URL` | `https://example.com/bdeploy-test-client/autorun.zip` | Application URL in the lifecycle run's temporary setup |
-| `BS_AUTH_URL`, `BS_API_URL`, `BS_PROVISION_URL` | `https://auth.bsn.cloud`, `https://api.bsn.cloud`, `https://provision.bsn.cloud` | Pointing the test client at a non-production environment |
 
 Keep the secret out of source control. Put these lines in an untracked `.env` or `.envrc`
 (both are already in this repository's `.gitignore`).

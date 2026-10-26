@@ -75,6 +75,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.auth_url, "https://auth.bsn.cloud")
         self.assertIsNone(config.username)
 
+    def test_host_variables_are_not_read(self) -> None:
+        config = Config.from_environment(
+            {
+                "BS_CLIENT_ID": "a",
+                "BS_SECRET": "b",
+                "BS_NETWORK": "n",
+                "BS_PROVISION_URL": "https://provision.bsn-staging.net",
+                "BS_API_URL": "https://api.example.net",
+                "BS_AUTH_URL": "https://auth.example.net",
+            }
+        )
+        self.assertEqual(config.provision_url, "https://provision.bsn.cloud")
+        self.assertEqual(config.api_url, "https://api.bsn.cloud")
+        self.assertEqual(config.auth_url, "https://auth.bsn.cloud")
+
     def test_plain_http_is_rejected_for_remote_hosts(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "https"):
             Config(client_id="a", client_secret="b", network="n", provision_url="http://provision.bsn.cloud")
