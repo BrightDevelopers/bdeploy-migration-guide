@@ -11,7 +11,7 @@ This repository gives you what you need to automate B-Deploy from your own syste
 - a step-by-step guide for moving an existing v1 integration;
 - OpenAPI 3.0 specifications you can browse or feed to a code generator;
 - a ready-to-run Python test client that checks your credentials and exercises the API;
-- a Claude Code skill that applies all of this to your code ([install it](#claude-code-skill)).
+- an AI coding assistant skill that applies all of this to your code ([install it](#ai-coding-assistant-skill)).
 
 ## Where to start
 
@@ -22,37 +22,27 @@ This repository gives you what you need to automate B-Deploy from your own syste
 | Move a v1 integration to v2/v3 | [`docs/MIGRATION-v1-to-v2.md`](docs/MIGRATION-v1-to-v2.md) |
 | See a working client to copy from | [`src/`](src/README.md): Python, standard library only |
 | Generate client code or browse the API | [`swagger/bdeploy-v2-v3.yaml`](swagger/bdeploy-v2-v3.yaml) and [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) |
-| Have Claude Code port or review your client code | [Claude Code skill](#claude-code-skill) |
+| Have an AI coding assistant port or review your client code | [AI coding assistant skill](#ai-coding-assistant-skill) |
 
-## Claude Code skill
+## AI coding assistant skill
 
-If you use [Claude Code](https://claude.com/claude-code), install the bundled skill. It
-gives Claude the B-Deploy wire contract and every pitfall in this repository, so it can
-port a v1 client, write a new v2/v3 client, or review existing client code in any
-language. It also reports changes your callers will notice, such as the move from a
-user name and password to API client credentials.
+The repository includes a skill for AI coding assistants. It gives your assistant the
+B-Deploy wire contract and every pitfall in this repository, so it can port a v1 client,
+write a new v2/v3 client, or review existing client code in any language. It also
+reports changes your callers will notice, such as the move from a user name and password
+to API client credentials.
 
-**Install it** by copying the skill folder into a skills directory:
+The skill is the folder `skills/migrating-bdeploy-v1-to-v2/`. It holds a single
+`SKILL.md` in the Agent Skills format: Markdown with `name` and `description`
+front-matter. **To install it, follow the instructions for installing skills in your
+preferred agent.** If your agent does not support skills, give it the contents of
+`SKILL.md` as project instructions instead. The rules are plain text and need no special
+tooling.
 
-```bash
-# For one project: run from the root of the project that holds your B-Deploy client
-mkdir -p .claude/skills
-cp -r /path/to/bdeploy-migration-guide/skills/migrating-bdeploy-v1-to-v2 .claude/skills/
-
-# Or for every project on this machine
-mkdir -p ~/.claude/skills
-cp -r /path/to/bdeploy-migration-guide/skills/migrating-bdeploy-v1-to-v2 ~/.claude/skills/
-```
-
-The result must be `.claude/skills/migrating-bdeploy-v1-to-v2/SKILL.md`. Commit the
-project copy if your team should share it.
-
-**Use it** by starting a new Claude Code session in your project. Then either:
-
-- ask in plain words, for example *"migrate our B-Deploy client to the v2/v3 API"* or
-  *"review this B-Deploy code against the current API"*, and Claude loads the skill when
-  the task matches; or
-- type `/migrating-bdeploy-v1-to-v2` to load it explicitly.
+For example, in Claude Code you copy the folder into a project's `.claude/skills/`
+directory (or `~/.claude/skills/` for every project). Then start a new session and either
+ask in plain words, such as *"migrate our B-Deploy client to the v2/v3 API"*, or type
+`/migrating-bdeploy-v1-to-v2`.
 
 To update the skill, copy the folder again over the old one.
 
@@ -256,7 +246,7 @@ list.
 | [`swagger/bsn-main-provisioning.yaml`](swagger/bsn-main-provisioning.yaml) | OpenAPI 3.0: access token, network selection, network list, registration tokens |
 | [`swagger/v1Documentation.yaml`](swagger/v1Documentation.yaml) | OpenAPI 3.0: the legacy v1 API, for maintaining or migrating old clients |
 | [`src/`](src/README.md) | Python test client: live check, end-to-end lifecycle test, reusable client class |
-| [`skills/migrating-bdeploy-v1-to-v2/`](skills/migrating-bdeploy-v1-to-v2/SKILL.md) | Claude Code skill for migrating and reviewing B-Deploy client code |
+| [`skills/migrating-bdeploy-v1-to-v2/`](skills/migrating-bdeploy-v1-to-v2/SKILL.md) | AI coding assistant skill for writing, migrating and reviewing B-Deploy client code |
 
 ## Browsing the specs and generating code
 
